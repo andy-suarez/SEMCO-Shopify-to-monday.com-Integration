@@ -85,11 +85,15 @@ async def _discover_column_ids() -> None:
     }
     """
     result = await monday_request(query, {"boardId": [board_id]})
-    if not result or not result.get("data", {}).get("boards"):
-        logger.error("Could not query board %s for column discovery", board_id)
+    if not result:
+        logger.error("COLUMN DISCOVERY FAILED: No response from Monday.com API for board %s", board_id)
+        return
+    if not result.get("data", {}).get("boards"):
+        logger.error("COLUMN DISCOVERY FAILED: Board %s not found or returned no data. Response: %s", board_id, result)
         return
 
     parent_cols = result["data"]["boards"][0]["columns"]
+    logger.info("Found %d parent columns on board %s", len(parent_cols), board_id)
     parent_map: dict[str, str] = {}
 
     subitem_board_id = None
@@ -98,7 +102,7 @@ async def _discover_column_ids() -> None:
         for key, display_name in PARENT_COL_NAMES.items():
             if col["title"] == display_name:
                 parent_map[key] = col["id"]
-                logger.info("  Parent column '%s' → %s (%s)", display_name, col["id"], col["type"])
+                logger.info("  MATCHED parent column '%s' → ID: %s (type: %s)", display_name, col["id"], col["type"])
 
         # Find subitem board ID
         if col["type"] == "subtasks":
@@ -107,36 +111,48 @@ async def _discover_column_ids() -> None:
                 ids = settings.get("boardIds", [])
                 if ids:
                     subitem_board_id = str(ids[0])
-            except (json.JSONDecodeError, KeyError):
-                pass
+                    logger.info("  Found subitem board ID: %s", subitem_board_id)
+                else:
+                    logger.error("  Subtasks column found but no boardIds in settings: %s", col["settings_str"])
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.error("  Failed to parse subtasks settings: %s — Error: %s", col["settings_str"], e)
+
+    # Log which parent columns were NOT found
+    for key, display_name in PARENT_COL_NAMES.items():
+        if key not in parent_map:
+            logger.warning("  MISSING parent column '%s' — will skip this field on orders", display_name)
 
     # --- Subitem columns ---
     subitem_map: dict[str, str] = {}
     if subitem_board_id:
         sub_result = await monday_request(query, {"boardId": [subitem_board_id]})
-        if sub_result and sub_result.get("data", {}).get("boards"):
+        if not sub_result:
+            logger.error("SUBITEM DISCOVERY FAILED: No response from Monday.com API for subitem board %s", subitem_board_id)
+        elif not sub_result.get("data", {}).get("boards"):
+            logger.error("SUBITEM DISCOVERY FAILED: Subitem board %s not found. Response: %s", subitem_board_id, sub_result)
+        else:
             sub_cols = sub_result["data"]["boards"][0]["columns"]
+            logger.info("Found %d subitem columns on subitem board %s", len(sub_cols), subitem_board_id)
             for col in sub_cols:
                 for key, display_name in SUBITEM_COL_NAMES.items():
                     if col["title"] == display_name:
                         subitem_map[key] = col["id"]
-                        logger.info("  Subitem column '%s' → %s (%s)", display_name, col["id"], col["type"])
-    else:
-        logger.warning("Could not find subitem board ID for board %s", board_id)
+                        logger.info("  MATCHED subitem column '%s' → ID: %s (type: %s)", display_name, col["id"], col["type"])
 
-    # Verify all required columns were found
-    missing = []
-    for key in PARENT_COL_NAMES:
-        if key not in parent_map:
-            missing.append(f"Parent: {PARENT_COL_NAMES[key]}")
-    for key in SUBITEM_COL_NAMES:
-        if key not in subitem_map:
-            missing.append(f"Subitem: {SUBITEM_COL_NAMES[key]}")
-
-    if missing:
-        logger.error("Missing columns on board %s: %s", board_id, ", ".join(missing))
+            # Log which subitem columns were NOT found
+            for key, display_name in SUBITEM_COL_NAMES.items():
+                if key not in subitem_map:
+                    logger.warning("  MISSING subitem column '%s' — will skip this field on subitems", display_name)
     else:
-        logger.info("All column IDs discovered successfully for board %s", board_id)
+        logger.error("SUBITEM DISCOVERY FAILED: Could not find subitem board ID for board %s", board_id)
+
+    # Summary
+    found_count = len(parent_map) + len(subitem_map)
+    total_count = len(PARENT_COL_NAMES) + len(SUBITEM_COL_NAMES)
+    if found_count == total_count:
+        logger.info("Column discovery complete: ALL %d/%d columns found for board %s", found_count, total_count, board_id)
+    else:
+        logger.warning("Column discovery complete: %d/%d columns found for board %s — missing columns will be skipped", found_count, total_count, board_id)
 
     _column_cache["board_id"] = board_id
     _column_cache["parent"] = parent_map
@@ -172,12 +188,26 @@ async def monday_request(query: str, variables: dict) -> dict | None:
     }
     payload = {"query": query, "variables": variables}
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(MONDAY_API_URL, headers=headers, json=payload)
-        data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(MONDAY_API_URL, headers=headers, json=payload)
+            data = resp.json()
+    except httpx.TimeoutException:
+        logger.error("Monday.com API request TIMED OUT after 30s. Query: %s", query[:100])
+        return None
+    except httpx.HTTPError as e:
+        logger.error("Monday.com API HTTP error: %s", e)
+        return None
+    except Exception as e:
+        logger.error("Monday.com API unexpected error: %s — %s", type(e).__name__, e)
+        return None
 
     if "errors" in data:
-        logger.error("Monday.com API errors: %s", data["errors"])
+        logger.error("Monday.com API returned errors: %s | Query: %s | Variables: %s", data["errors"], query[:100], variables)
+        return None
+
+    if resp.status_code != 200:
+        logger.error("Monday.com API returned status %d: %s", resp.status_code, data)
         return None
 
     return data
@@ -195,17 +225,25 @@ async def create_parent_item(item_name: str, column_values: dict) -> str | None:
         }
     }
     """
+    col_values_json = json.dumps(column_values)
     variables = {
         "boardId": MONDAY_BOARD_ID,
         "itemName": item_name,
-        "columnValues": json.dumps(column_values),
+        "columnValues": col_values_json,
     }
+    logger.info("Creating parent item: '%s' with columns: %s", item_name, col_values_json)
     result = await monday_request(query, variables)
     if result and "data" in result:
-        item_id = result["data"]["create_item"]["id"]
-        logger.info("Created parent item: %s (ID: %s)", item_name, item_id)
-        return item_id
-    return None
+        try:
+            item_id = result["data"]["create_item"]["id"]
+            logger.info("SUCCESS: Created parent item '%s' (ID: %s)", item_name, item_id)
+            return item_id
+        except (KeyError, TypeError) as e:
+            logger.error("FAILED: Unexpected response structure creating parent item '%s': %s — Response: %s", item_name, e, result)
+            return None
+    else:
+        logger.error("FAILED: Could not create parent item '%s'. Result: %s", item_name, result)
+        return None
 
 
 async def create_subitem(parent_item_id: str, item_name: str, column_values: dict) -> str | None:
@@ -220,17 +258,25 @@ async def create_subitem(parent_item_id: str, item_name: str, column_values: dic
         }
     }
     """
+    col_values_json = json.dumps(column_values)
     variables = {
         "parentItemId": parent_item_id,
         "itemName": item_name,
-        "columnValues": json.dumps(column_values),
+        "columnValues": col_values_json,
     }
+    logger.info("Creating subitem: '%s' under parent %s with columns: %s", item_name, parent_item_id, col_values_json)
     result = await monday_request(query, variables)
     if result and "data" in result:
-        sub_id = result["data"]["create_subitem"]["id"]
-        logger.info("Created subitem: %s (ID: %s)", item_name, sub_id)
-        return sub_id
-    return None
+        try:
+            sub_id = result["data"]["create_subitem"]["id"]
+            logger.info("SUCCESS: Created subitem '%s' (ID: %s) under parent %s", item_name, sub_id, parent_item_id)
+            return sub_id
+        except (KeyError, TypeError) as e:
+            logger.error("FAILED: Unexpected response structure creating subitem '%s': %s — Response: %s", item_name, e, result)
+            return None
+    else:
+        logger.error("FAILED: Could not create subitem '%s' under parent %s. Result: %s", item_name, parent_item_id, result)
+        return None
 
 # ---------------------------------------------------------------------------
 # Order parsing helpers
@@ -243,15 +289,20 @@ def extract_contact_name(order: dict) -> str:
             first = (addr.get("first_name") or "").strip()
             last = (addr.get("last_name") or "").strip()
             if first or last:
-                return f"{first} {last}".strip()
+                name = f"{first} {last}".strip()
+                logger.info("Contact name resolved from %s: '%s'", key, name)
+                return name
 
     customer = order.get("customer")
     if customer:
         first = (customer.get("first_name") or "").strip()
         last = (customer.get("last_name") or "").strip()
         if first or last:
-            return f"{first} {last}".strip()
+            name = f"{first} {last}".strip()
+            logger.info("Contact name resolved from customer: '%s'", name)
+            return name
 
+    logger.warning("No contact name found — using 'Unknown Contact'")
     return "Unknown Contact"
 
 
@@ -261,25 +312,36 @@ def extract_company_name(order: dict) -> str:
         if addr:
             company = (addr.get("company") or "").strip()
             if company:
+                logger.info("Company name resolved from %s: '%s'", key, company)
                 return company
 
+    logger.warning("No company name found — using 'No Company'")
     return "No Company"
 
 
 def map_shipping_type(order: dict) -> str | None:
     shipping_lines = order.get("shipping_lines") or []
+    if not shipping_lines:
+        logger.info("No shipping lines in order — leaving Type Shipment empty")
+        return None
+
     for line in shipping_lines:
         title = (line.get("title") or "").lower()
         code = (line.get("code") or "").lower()
         combined = f"{title} {code}"
+        logger.info("Checking shipping line: title='%s' code='%s'", line.get("title"), line.get("code"))
 
         if "ups" in combined:
+            logger.info("Shipping type mapped to: UPS")
             return "UPS"
         if "ltl" in combined:
+            logger.info("Shipping type mapped to: LTL")
             return "LTL"
         if "will call" in combined:
+            logger.info("Shipping type mapped to: Will Calls")
             return "Will Calls"
 
+    logger.warning("Shipping lines found but no match for UPS/LTL/Will Call. Lines: %s", shipping_lines)
     return None
 
 # ---------------------------------------------------------------------------
@@ -293,13 +355,16 @@ async def process_order(order: dict, store_key: str) -> None:
     store = STORES[store_key]
     order_name = order.get("name", "Unknown")
 
+    logger.info("=" * 60)
+    logger.info("PROCESSING ORDER: %s from store: %s", order_name, store_key)
+    logger.info("=" * 60)
+
     contact = extract_contact_name(order)
     company = extract_company_name(order)
     item_name = f"{contact} / {company} / Order{order_name}"
+    logger.info("Parent item name: '%s'", item_name)
 
-    logger.info("Processing order %s from %s", order_name, store_key)
-
-    # Build parent column values
+    # Build parent column values — skip missing columns
     now = datetime.now(timezone.utc)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -308,29 +373,39 @@ async def process_order(order: dict, store_key: str) -> None:
     col_time = get_parent_col("time_of_order")
     if col_time:
         column_values[col_time] = timestamp_str
+        logger.info("Setting 'Time of Order' → '%s'", timestamp_str)
+    else:
+        logger.warning("SKIPPING 'Time of Order' — column not found on board")
 
     col_type = get_parent_col("type")
     if col_type:
         column_values[col_type] = {"label": store["type_label"]}
+        logger.info("Setting 'Type' → '%s'", store["type_label"])
+    else:
+        logger.warning("SKIPPING 'Type' — column not found on board")
 
     shipment_type = map_shipping_type(order)
     if shipment_type:
         col_shipment = get_parent_col("type_shipment")
         if col_shipment:
             column_values[col_shipment] = {"label": shipment_type}
-        logger.info("Shipping type mapped to: %s", shipment_type)
-    else:
-        logger.info("No shipping type match — leaving Type Shipment empty")
+            logger.info("Setting 'Type Shipment' → '%s'", shipment_type)
+        else:
+            logger.warning("SKIPPING 'Type Shipment' — column not found on board (value would have been '%s')", shipment_type)
 
     # Create parent item
     parent_id = await create_parent_item(item_name, column_values)
     if not parent_id:
-        logger.error("Failed to create parent item for order %s", order_name)
+        logger.error("ABORTING ORDER %s: Failed to create parent item — subitems will not be created", order_name)
         return
 
     # Create subitems for each line item
     line_items = order.get("line_items") or []
-    for li in line_items:
+    logger.info("Processing %d line items for order %s", len(line_items), order_name)
+
+    success_count = 0
+    fail_count = 0
+    for i, li in enumerate(line_items, 1):
         product_title = li.get("title", "Unknown Product")
         variant_title = (li.get("variant_title") or "").strip()
         if variant_title:
@@ -339,15 +414,26 @@ async def process_order(order: dict, store_key: str) -> None:
             subitem_name = product_title
 
         quantity = li.get("quantity", 1)
-        sub_columns: dict = {}
+        logger.info("Line item %d/%d: '%s' x%d", i, len(line_items), subitem_name, quantity)
 
+        sub_columns: dict = {}
         col_qty = get_subitem_col("quantity")
         if col_qty:
             sub_columns[col_qty] = str(quantity)
+        else:
+            logger.warning("SKIPPING 'Quantity1' for subitem '%s' — column not found on board", subitem_name)
 
-        await create_subitem(parent_id, subitem_name, sub_columns)
+        result = await create_subitem(parent_id, subitem_name, sub_columns)
+        if result:
+            success_count += 1
+        else:
+            fail_count += 1
 
-    logger.info("Finished processing order %s — %d line items", order_name, len(line_items))
+    logger.info("=" * 60)
+    logger.info("ORDER %s COMPLETE: %d/%d subitems created successfully", order_name, success_count, len(line_items))
+    if fail_count > 0:
+        logger.error("ORDER %s: %d subitem(s) FAILED to create", order_name, fail_count)
+    logger.info("=" * 60)
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -364,34 +450,49 @@ async def health():
 @app.post("/webhook/{store_key}")
 async def webhook(store_key: str, request: Request):
     if store_key not in STORES:
+        logger.warning("Webhook received for UNKNOWN store_key: '%s'", store_key)
         return Response(status_code=404, content="Unknown store")
 
     body = await request.body()
     header_hmac = request.headers.get("X-Shopify-Hmac-Sha256", "")
 
-    if not header_hmac or not verify_hmac(body, STORES[store_key]["secret"], header_hmac):
-        logger.warning("HMAC verification failed for %s", store_key)
+    if not header_hmac:
+        logger.warning("Webhook from %s REJECTED: Missing X-Shopify-Hmac-Sha256 header", store_key)
         return Response(status_code=401, content="HMAC verification failed")
 
-    order = json.loads(body)
+    if not verify_hmac(body, STORES[store_key]["secret"], header_hmac):
+        logger.warning("Webhook from %s REJECTED: HMAC signature mismatch", store_key)
+        return Response(status_code=401, content="HMAC verification failed")
+
+    try:
+        order = json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error("Webhook from %s: Failed to parse JSON body: %s", store_key, e)
+        return Response(status_code=200, content="OK")
+
     topic = request.headers.get("X-Shopify-Topic", "unknown")
     logger.info("Webhook received: store=%s order=%s topic=%s", store_key, order.get("name"), topic)
 
     try:
         await process_order(order, store_key)
     except Exception:
-        logger.exception("Error processing order %s from %s", order.get("name"), store_key)
+        logger.exception("UNHANDLED ERROR processing order %s from %s", order.get("name"), store_key)
 
     return Response(status_code=200, content="OK")
 
 
 @app.post("/test")
 async def test_endpoint(request: Request):
-    body = await request.body()
-    order = json.loads(body)
+    try:
+        body = await request.body()
+        order = json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error("Test endpoint: Failed to parse JSON body: %s", e)
+        return {"status": "error", "message": f"Invalid JSON: {e}"}
 
     store_key = order.pop("_store_key", "semco_pro")
     if store_key not in STORES:
+        logger.warning("Test endpoint: Unknown store_key '%s' — defaulting to semco_pro", store_key)
         store_key = "semco_pro"
 
     logger.info("Test endpoint: processing order %s as %s", order.get("name"), store_key)
@@ -399,6 +500,7 @@ async def test_endpoint(request: Request):
     try:
         await process_order(order, store_key)
     except Exception:
-        logger.exception("Error processing test order %s", order.get("name"))
+        logger.exception("UNHANDLED ERROR processing test order %s", order.get("name"))
+        return {"status": "error", "order": order.get("name"), "store": store_key, "message": "See server logs"}
 
     return {"status": "processed", "order": order.get("name"), "store": store_key}
