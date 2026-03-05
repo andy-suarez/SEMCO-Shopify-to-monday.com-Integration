@@ -78,7 +78,7 @@ Column IDs are cached in memory and re-discovered whenever `MONDAY_BOARD_ID` cha
 
 ### Monday.com Item Structure
 - **Parent item name:** `{Contact Name} / {Company Name} / Order{order_name}`
-- **Parent columns:** Time of Order (text timestamp), Type (SEMCO SURFACE / SEMCO SPACES / SEMCO CONNECT), Type Shipment (UPS/LTL/Will Calls)
+- **Parent columns:** Time of Order (text timestamp), Type (SEMCO SURFACE / SEMCO SPACES / SEMCO CONNECT), Type Shipment (UPS/LTL/WILL CALL)
 - **Subitem name:** `{Product Title} - {Variant Title}`
 - **Subitem columns:** Quantity1 (numbers)
 
@@ -104,7 +104,7 @@ Column IDs are cached in memory and re-discovered whenever `MONDAY_BOARD_ID` cha
 ### Shipping Method Mapping (case-insensitive contains)
 - `ups` → `UPS`
 - `ltl` → `LTL`
-- `will call` → `Will Calls`
+- `will call` → `WILL CALL`
 - No match → leave empty
 
 ## Monthly Board Rotation
