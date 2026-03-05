@@ -338,8 +338,8 @@ def map_shipping_type(order: dict) -> str | None:
             logger.info("Shipping type mapped to: LTL")
             return "LTL"
         if "will call" in combined:
-            logger.info("Shipping type mapped to: Will Calls")
-            return "Will Calls"
+            logger.info("Shipping type mapped to: WILL CALL")
+            return "WILL CALL"
 
     logger.warning("Shipping lines found but no match for UPS/LTL/Will Call. Lines: %s", shipping_lines)
     return None
