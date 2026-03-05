@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A Python/FastAPI web service that receives Shopify `orders/create` webhooks from two stores (SEMCO Pro and SEMCO Spaces) and creates structured items on a Monday.com board in real time. Parent items represent orders; subitems represent individual products.
+A Python/FastAPI web service that receives Shopify `orders/create` webhooks from three stores (SEMCO Pro, SEMCO Spaces, and SEMCO Connect) and creates structured items on a Monday.com board in real time. Parent items represent orders; subitems represent individual products.
 
 Deployed as a Docker container on Render (Starter plan, always-on).
 
@@ -32,24 +32,43 @@ Deployed as a Docker container on Render (Starter plan, always-on).
 
 ## Environment Variables
 
-All config is via environment variables (no `.env` in production):
+All config is via environment variables (no `.env` in production). Column IDs are **auto-discovered** by display name — no need to configure them manually.
 
 | Variable | Description |
 |----------|-------------|
 | `MONDAY_API_KEY` | Monday.com API token |
-| `MONDAY_BOARD_ID` | Target board ID (integer) |
-| `COL_ORDER_INPUT_TIME` | Column ID for Order Input Time |
-| `COL_TYPE` | Column ID for Type column |
-| `COL_TYPE_SHIPMENT` | Column ID for Type Shipment column |
-| `COL_SUBITEM_QUANTITY` | Column ID for Quantity1 subitem column |
+| `MONDAY_BOARD_ID` | Target board ID (update monthly when board is duplicated) |
 | `SHOPIFY_SEMCO_PRO_SECRET` | Webhook signing secret for SEMCO Pro |
 | `SHOPIFY_SEMCO_SPACES_SECRET` | Webhook signing secret for SEMCO Spaces |
+| `SHOPIFY_SEMCO_CONNECT_SECRET` | Webhook signing secret for SEMCO Connect |
+
+## Stores
+
+| Store Key | Shopify Store | Monday.com "Type" Label | Webhook Path |
+|-----------|--------------|------------------------|--------------|
+| `semco_pro` | SEMCO Pro | `SEMCO SURFACE` | `/webhook/semco_pro` |
+| `semco_spaces` | SEMCO Spaces | `SEMCO SPACES` | `/webhook/semco_spaces` |
+| `semco_connect` | SEMCO Connect | `SEMCO CONNECT` | `/webhook/semco_connect` |
+
+## Column Auto-Discovery
+
+Column IDs are resolved automatically by matching display names on the Monday.com board. This means when the board is duplicated each month, you only need to update `MONDAY_BOARD_ID` — the new column IDs are discovered on the first webhook.
+
+**Parent columns matched by name:**
+- `Time of Order` (text) — receives UTC timestamp
+- `Type` (status) — store type label
+- `Type Shipment` (status) — shipping method
+
+**Subitem columns matched by name:**
+- `Quantity1` (numbers) — product quantity
+
+Column IDs are cached in memory and re-discovered whenever `MONDAY_BOARD_ID` changes.
 
 ## Key Conventions
 
 ### API Endpoints
 - `GET /health` — health check
-- `POST /webhook/{store_key}` — receives Shopify webhooks (`semco_pro` or `semco_spaces`)
+- `POST /webhook/{store_key}` — receives Shopify webhooks (`semco_pro`, `semco_spaces`, or `semco_connect`)
 - `POST /test` — dev-only endpoint, no HMAC verification
 
 ### Webhook Security
@@ -58,8 +77,8 @@ All config is via environment variables (no `.env` in production):
 - Return 401 on HMAC failure, 404 on unknown store_key
 
 ### Monday.com Item Structure
-- **Parent item name:** `{Contact Name} / {Company Name} / Order#{order_name}`
-- **Parent columns:** Order Input Time (date+time), Type (SEMCO SURFACE or SEMCO SPACES), Type Shipment (UPS/LTL/Will Calls)
+- **Parent item name:** `{Contact Name} / {Company Name} / Order{order_name}`
+- **Parent columns:** Time of Order (text timestamp), Type (SEMCO SURFACE / SEMCO SPACES / SEMCO CONNECT), Type Shipment (UPS/LTL/Will Calls)
 - **Subitem name:** `{Product Title} - {Variant Title}`
 - **Subitem columns:** Quantity1 (numbers)
 
@@ -88,6 +107,13 @@ All config is via environment variables (no `.env` in production):
 - `will call` → `Will Calls`
 - No match → leave empty
 
+## Monthly Board Rotation
+
+The Monday.com board is duplicated and renamed each month. When this happens:
+1. Get the new board ID from the Monday.com URL
+2. Update `MONDAY_BOARD_ID` in Render environment variables
+3. Redeploy — column IDs are auto-discovered on the next webhook
+
 ## Build & Run
 
 ```bash
@@ -104,7 +130,7 @@ curl -X POST http://localhost:8000/test -H "Content-Type: application/json" -d @
 # Health check
 curl http://localhost:8000/health
 
-# Discover Monday.com column IDs
+# Discover Monday.com column IDs (debugging)
 python get_column_ids.py <MONDAY_API_KEY> <BOARD_ID>
 ```
 

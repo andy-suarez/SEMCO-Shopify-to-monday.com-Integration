@@ -30,11 +30,6 @@ app = FastAPI(title="Shopify → Monday.com Order Sync")
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY", "")
 MONDAY_BOARD_ID = os.environ.get("MONDAY_BOARD_ID", "")
 
-COL_ORDER_INPUT_TIME = os.environ.get("COL_ORDER_INPUT_TIME", "")
-COL_TYPE = os.environ.get("COL_TYPE", "")
-COL_TYPE_SHIPMENT = os.environ.get("COL_TYPE_SHIPMENT", "")
-COL_SUBITEM_QUANTITY = os.environ.get("COL_SUBITEM_QUANTITY", "")
-
 STORES = {
     "semco_pro": {
         "secret": os.environ.get("SHOPIFY_SEMCO_PRO_SECRET", ""),
@@ -44,9 +39,117 @@ STORES = {
         "secret": os.environ.get("SHOPIFY_SEMCO_SPACES_SECRET", ""),
         "type_label": "SEMCO SPACES",
     },
+    "semco_connect": {
+        "secret": os.environ.get("SHOPIFY_SEMCO_CONNECT_SECRET", ""),
+        "type_label": "SEMCO CONNECT",
+    },
 }
 
 MONDAY_API_URL = "https://api.monday.com/v2"
+
+# Column names to match on the board (auto-discovered by display name)
+PARENT_COL_NAMES = {
+    "time_of_order": "Time of Order",
+    "type": "Type",
+    "type_shipment": "Type Shipment",
+}
+SUBITEM_COL_NAMES = {
+    "quantity": "Quantity1",
+}
+
+# ---------------------------------------------------------------------------
+# Column ID cache — auto-discovered from board, refreshed on board ID change
+# ---------------------------------------------------------------------------
+_column_cache: dict = {
+    "board_id": None,
+    "parent": {},    # {"time_of_order": "text_mkt3txbf", ...}
+    "subitem": {},   # {"quantity": "numeric_mm15nd14", ...}
+}
+
+
+async def _discover_column_ids() -> None:
+    """Query the Monday.com board and resolve column IDs by display name."""
+    board_id = MONDAY_BOARD_ID
+
+    if _column_cache["board_id"] == board_id and _column_cache["parent"]:
+        return  # Already cached for this board
+
+    logger.info("Discovering column IDs for board %s ...", board_id)
+
+    # --- Parent columns ---
+    query = """
+    query ($boardId: [ID!]) {
+        boards(ids: $boardId) {
+            columns { id title type settings_str }
+        }
+    }
+    """
+    result = await monday_request(query, {"boardId": [board_id]})
+    if not result or not result.get("data", {}).get("boards"):
+        logger.error("Could not query board %s for column discovery", board_id)
+        return
+
+    parent_cols = result["data"]["boards"][0]["columns"]
+    parent_map: dict[str, str] = {}
+
+    subitem_board_id = None
+    for col in parent_cols:
+        # Match parent columns by display name
+        for key, display_name in PARENT_COL_NAMES.items():
+            if col["title"] == display_name:
+                parent_map[key] = col["id"]
+                logger.info("  Parent column '%s' → %s (%s)", display_name, col["id"], col["type"])
+
+        # Find subitem board ID
+        if col["type"] == "subtasks":
+            try:
+                settings = json.loads(col["settings_str"])
+                ids = settings.get("boardIds", [])
+                if ids:
+                    subitem_board_id = str(ids[0])
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    # --- Subitem columns ---
+    subitem_map: dict[str, str] = {}
+    if subitem_board_id:
+        sub_result = await monday_request(query, {"boardId": [subitem_board_id]})
+        if sub_result and sub_result.get("data", {}).get("boards"):
+            sub_cols = sub_result["data"]["boards"][0]["columns"]
+            for col in sub_cols:
+                for key, display_name in SUBITEM_COL_NAMES.items():
+                    if col["title"] == display_name:
+                        subitem_map[key] = col["id"]
+                        logger.info("  Subitem column '%s' → %s (%s)", display_name, col["id"], col["type"])
+    else:
+        logger.warning("Could not find subitem board ID for board %s", board_id)
+
+    # Verify all required columns were found
+    missing = []
+    for key in PARENT_COL_NAMES:
+        if key not in parent_map:
+            missing.append(f"Parent: {PARENT_COL_NAMES[key]}")
+    for key in SUBITEM_COL_NAMES:
+        if key not in subitem_map:
+            missing.append(f"Subitem: {SUBITEM_COL_NAMES[key]}")
+
+    if missing:
+        logger.error("Missing columns on board %s: %s", board_id, ", ".join(missing))
+    else:
+        logger.info("All column IDs discovered successfully for board %s", board_id)
+
+    _column_cache["board_id"] = board_id
+    _column_cache["parent"] = parent_map
+    _column_cache["subitem"] = subitem_map
+
+
+def get_parent_col(key: str) -> str:
+    return _column_cache["parent"].get(key, "")
+
+
+def get_subitem_col(key: str) -> str:
+    return _column_cache["subitem"].get(key, "")
+
 
 # ---------------------------------------------------------------------------
 # Shopify HMAC verification
@@ -184,6 +287,9 @@ def map_shipping_type(order: dict) -> str | None:
 # ---------------------------------------------------------------------------
 
 async def process_order(order: dict, store_key: str) -> None:
+    # Ensure column IDs are discovered
+    await _discover_column_ids()
+
     store = STORES[store_key]
     order_name = order.get("name", "Unknown")
 
@@ -195,17 +301,23 @@ async def process_order(order: dict, store_key: str) -> None:
 
     # Build parent column values
     now = datetime.now(timezone.utc)
-    column_values: dict = {
-        COL_ORDER_INPUT_TIME: {
-            "date": now.strftime("%Y-%m-%d"),
-            "time": now.strftime("%H:%M:%S"),
-        },
-        COL_TYPE: {"label": store["type_label"]},
-    }
+    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    column_values: dict = {}
+
+    col_time = get_parent_col("time_of_order")
+    if col_time:
+        column_values[col_time] = timestamp_str
+
+    col_type = get_parent_col("type")
+    if col_type:
+        column_values[col_type] = {"label": store["type_label"]}
 
     shipment_type = map_shipping_type(order)
     if shipment_type:
-        column_values[COL_TYPE_SHIPMENT] = {"label": shipment_type}
+        col_shipment = get_parent_col("type_shipment")
+        if col_shipment:
+            column_values[col_shipment] = {"label": shipment_type}
         logger.info("Shipping type mapped to: %s", shipment_type)
     else:
         logger.info("No shipping type match — leaving Type Shipment empty")
@@ -227,9 +339,11 @@ async def process_order(order: dict, store_key: str) -> None:
             subitem_name = product_title
 
         quantity = li.get("quantity", 1)
-        sub_columns = {
-            COL_SUBITEM_QUANTITY: str(quantity),
-        }
+        sub_columns: dict = {}
+
+        col_qty = get_subitem_col("quantity")
+        if col_qty:
+            sub_columns[col_qty] = str(quantity)
 
         await create_subitem(parent_id, subitem_name, sub_columns)
 
