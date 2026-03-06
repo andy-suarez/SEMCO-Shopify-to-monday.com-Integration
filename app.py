@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+import zoneinfo
 from datetime import datetime, timezone
 
 import httpx
@@ -391,7 +392,7 @@ async def process_order(order: dict, store_key: str) -> None:
     logger.info("Parent item name: '%s'", item_name)
 
     # Build parent column values — skip missing columns
-    now = datetime.now(timezone.utc)
+    now = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles"))
     timestamp_str = now.strftime("%H:%M")
 
     column_values: dict = {}
