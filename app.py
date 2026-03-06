@@ -342,8 +342,8 @@ def extract_company_name(order: dict) -> str:
                 logger.info("Company name resolved from %s: '%s'", key, company)
                 return company
 
-    logger.warning("No company name found — using 'No Company'")
-    return "No Company"
+    logger.info("No company name found — skipping company in item name")
+    return ""
 
 
 def map_shipping_type(order: dict) -> str | None:
@@ -388,7 +388,10 @@ async def process_order(order: dict, store_key: str) -> None:
 
     contact = extract_contact_name(order)
     company = extract_company_name(order)
-    item_name = f"{contact} / {company} / Order{order_name}"
+    if company:
+        item_name = f"{contact} / {company} / Order{order_name}"
+    else:
+        item_name = f"{contact} / Order{order_name}"
     logger.info("Parent item name: '%s'", item_name)
 
     # Build parent column values — skip missing columns
