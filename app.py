@@ -392,7 +392,7 @@ async def process_order(order: dict, store_key: str) -> None:
 
     # Build parent column values — skip missing columns
     now = datetime.now(timezone.utc)
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp_str = now.strftime("%H:%M")
 
     column_values: dict = {}
 
