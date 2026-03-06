@@ -1,9 +1,11 @@
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -56,6 +58,30 @@ PARENT_COL_NAMES = {
 SUBITEM_COL_NAMES = {
     "quantity": "Quantity1",
 }
+
+# ---------------------------------------------------------------------------
+# Duplicate detection — tracks processed Shopify order IDs in memory
+# ---------------------------------------------------------------------------
+_processed_orders: dict[str, float] = {}  # {"store:order_id": timestamp}
+DEDUP_TTL_SECONDS = 3600  # Keep order IDs for 1 hour
+
+
+def _is_duplicate(store_key: str, order_id: str | int) -> bool:
+    """Check if this order was already processed. Returns True if duplicate."""
+    dedup_key = f"{store_key}:{order_id}"
+
+    # Clean up old entries (older than TTL)
+    now = time.time()
+    expired = [k for k, t in _processed_orders.items() if now - t > DEDUP_TTL_SECONDS]
+    for k in expired:
+        del _processed_orders[k]
+
+    if dedup_key in _processed_orders:
+        return True
+
+    _processed_orders[dedup_key] = now
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Column ID cache — auto-discovered from board, refreshed on board ID change
@@ -470,15 +496,29 @@ async def webhook(store_key: str, request: Request):
         logger.error("Webhook from %s: Failed to parse JSON body: %s", store_key, e)
         return Response(status_code=200, content="OK")
 
-    topic = request.headers.get("X-Shopify-Topic", "unknown")
-    logger.info("Webhook received: store=%s order=%s topic=%s", store_key, order.get("name"), topic)
+    # Duplicate detection — check before processing
+    order_id = order.get("id", "unknown")
+    order_name = order.get("name", "unknown")
+    if _is_duplicate(store_key, order_id):
+        logger.info("DUPLICATE SKIPPED: Order %s (ID: %s) from %s already processed", order_name, order_id, store_key)
+        return Response(status_code=200, content="OK")
 
+    topic = request.headers.get("X-Shopify-Topic", "unknown")
+    logger.info("Webhook received: store=%s order=%s topic=%s", store_key, order_name, topic)
+
+    # Process in background so we respond to Shopify immediately
+    asyncio.create_task(_safe_process_order(order, store_key, order_name))
+
+    logger.info("Responded 200 to Shopify for order %s — processing in background", order_name)
+    return Response(status_code=200, content="OK")
+
+
+async def _safe_process_order(order: dict, store_key: str, order_name: str) -> None:
+    """Wrapper to catch and log any errors from background processing."""
     try:
         await process_order(order, store_key)
     except Exception:
-        logger.exception("UNHANDLED ERROR processing order %s from %s", order.get("name"), store_key)
-
-    return Response(status_code=200, content="OK")
+        logger.exception("UNHANDLED ERROR processing order %s from %s", order_name, store_key)
 
 
 @app.post("/test")
