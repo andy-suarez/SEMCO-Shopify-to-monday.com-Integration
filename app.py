@@ -358,7 +358,7 @@ def map_shipping_type(order: dict) -> str | None:
         combined = f"{title} {code}"
         logger.info("Checking shipping line: title='%s' code='%s'", line.get("title"), line.get("code"))
 
-        if "ups" in combined:
+        if "ups" in combined or "flat rate" in combined or "economy" in combined:
             logger.info("Shipping type mapped to: UPS")
             return "UPS"
         if "ltl" in combined:
