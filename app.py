@@ -368,8 +368,9 @@ def map_shipping_type(order: dict) -> str | None:
             logger.info("Shipping type mapped to: WILL CALL")
             return "WILL CALL"
 
-    logger.warning("Shipping lines found but no match for UPS/LTL/Will Call. Lines: %s", shipping_lines)
-    return None
+    # If shipping lines exist but don't match known carriers, it's a will call address
+    logger.info("Shipping line didn't match UPS/LTL — defaulting to WILL CALL. Lines: %s", shipping_lines)
+    return "WILL CALL"
 
 # ---------------------------------------------------------------------------
 # Order processing
