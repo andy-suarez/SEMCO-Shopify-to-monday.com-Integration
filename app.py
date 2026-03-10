@@ -52,7 +52,7 @@ MONDAY_API_URL = "https://api.monday.com/v2"
 
 # Column names to match on the board (auto-discovered by display name)
 PARENT_COL_NAMES = {
-    "time_of_order": "Time of Order",
+    "time_of_order": "Order Input Time",
     "type": "Type",
     "type_shipment": "Type Shipment",
 }
@@ -364,7 +364,7 @@ def map_shipping_type(order: dict) -> str | None:
         if "ltl" in combined:
             logger.info("Shipping type mapped to: LTL")
             return "LTL"
-        if "will call" in combined:
+        if "will call" in combined or "pickup" in combined:
             logger.info("Shipping type mapped to: WILL CALL")
             return "WILL CALL"
 
