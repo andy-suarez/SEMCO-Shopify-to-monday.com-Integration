@@ -376,6 +376,28 @@ def map_shipping_type(order: dict) -> str | None:
 # Order processing
 # ---------------------------------------------------------------------------
 
+# Sample product names to filter out (case-insensitive)
+SAMPLE_PRODUCT_NAMES = [
+    "architectural sample kits",           # SEMCO Pro
+    "x-bond microcement physical color samples",  # SEMCO Spaces
+]
+
+
+def _is_sample_only_order(order: dict) -> bool:
+    """Check if the order contains ONLY sample items. Returns True if so."""
+    line_items = order.get("line_items") or []
+    if not line_items:
+        return False
+
+    for li in line_items:
+        title = (li.get("title") or "").lower()
+        is_sample = any(sample in title for sample in SAMPLE_PRODUCT_NAMES)
+        if not is_sample:
+            return False  # Found a non-sample item — order should be posted
+
+    return True  # All items are samples
+
+
 async def process_order(order: dict, store_key: str) -> None:
     # Ensure column IDs are discovered
     await _discover_column_ids()
@@ -386,6 +408,11 @@ async def process_order(order: dict, store_key: str) -> None:
     logger.info("=" * 60)
     logger.info("PROCESSING ORDER: %s from store: %s", order_name, store_key)
     logger.info("=" * 60)
+
+    # Filter out sample-only orders
+    if _is_sample_only_order(order):
+        logger.info("SKIPPING ORDER %s: Contains only sample items — not posting to Monday.com", order_name)
+        return
 
     contact = extract_contact_name(order)
     company = extract_company_name(order)
