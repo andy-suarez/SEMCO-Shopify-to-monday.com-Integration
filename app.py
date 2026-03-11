@@ -439,15 +439,24 @@ async def process_order(order: dict, store_key: str) -> None:
     for i, li in enumerate(line_items, 1):
         product_title = li.get("title", "Unknown Product")
         variant_title = (li.get("variant_title") or "").strip()
+
+        # Extract color from custom properties (Shopify plugin)
+        color = ""
+        for prop in (li.get("properties") or []):
+            if (prop.get("name") or "").lower() == "color":
+                color = (prop.get("value") or "").strip()
+                break
+
+        # Build subitem name: Title - Variant - Color (skip empty parts)
+        parts = [product_title]
         if variant_title:
-            subitem_name = f"{product_title} - {variant_title}"
-        else:
-            subitem_name = product_title
+            parts.append(variant_title)
+        if color:
+            parts.append(color)
+        subitem_name = " - ".join(parts)
 
         quantity = li.get("quantity", 1)
         logger.info("Line item %d/%d: '%s' x%d", i, len(line_items), subitem_name, quantity)
-        # Log full line item for debugging custom properties (e.g. color)
-        logger.info("DEBUG line_item raw data: %s", json.dumps(li, default=str))
 
         sub_columns: dict = {}
         col_qty = get_subitem_col("quantity")
