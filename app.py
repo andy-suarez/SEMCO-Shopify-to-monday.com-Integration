@@ -484,6 +484,7 @@ async def process_order(order: dict, store_key: str) -> None:
 
         quantity = li.get("quantity", 1)
         logger.info("Line item %d/%d: '%s' x%d", i, len(line_items), subitem_name, quantity)
+        logger.info("DEBUG line_item properties: %s", li.get("properties", []))
 
         sub_columns: dict = {}
         col_qty = get_subitem_col("quantity")
