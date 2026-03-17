@@ -383,6 +383,41 @@ SAMPLE_PRODUCT_NAMES = [
 ]
 
 
+def _expand_line_item_colors(li: dict) -> list[dict]:
+    """Expand a single line item into multiple entries if it has multiple color properties.
+
+    Returns a list of dicts with keys: title, variant_title, color, quantity.
+
+    Two known property formats:
+      Spaces: [{'name': 'Color', 'value': 'Charcoal Grey'}]           → single color
+      Pro:    [{'name': 'Mojave', 'value': '3'}, {'name': 'Phantom', 'value': '4'}] → multi color
+    """
+    product_title = li.get("title", "Unknown Product")
+    variant_title = (li.get("variant_title") or "").strip()
+    total_quantity = li.get("quantity", 1)
+    properties = li.get("properties") or []
+
+    # Check for Spaces format first (single property named "Color")
+    for prop in properties:
+        if (prop.get("name") or "").strip().lower() == "color":
+            color = (prop.get("value") or "").strip()
+            return [{"title": product_title, "variant_title": variant_title, "color": color, "quantity": total_quantity}]
+
+    # Check for Pro format: name is the color, value is the quantity (digit)
+    color_entries = []
+    for prop in properties:
+        prop_name = (prop.get("name") or "").strip()
+        prop_value = (prop.get("value") or "").strip()
+        if prop_name and prop_value.isdigit():
+            color_entries.append({"title": product_title, "variant_title": variant_title, "color": prop_name, "quantity": int(prop_value)})
+
+    if color_entries:
+        return color_entries
+
+    # No color properties — return as-is
+    return [{"title": product_title, "variant_title": variant_title, "color": "", "quantity": total_quantity}]
+
+
 def _is_sample_only_order(order: dict) -> bool:
     """Check if the order contains ONLY sample items. Returns True if so."""
     line_items = order.get("line_items") or []
@@ -461,41 +496,31 @@ async def process_order(order: dict, store_key: str) -> None:
     line_items = order.get("line_items") or []
     logger.info("Processing %d line items for order %s", len(line_items), order_name)
 
+    # Expand line items — a single line item with multiple color properties
+    # gets split into separate subitems (e.g., 3 Mojave + 4 Phantom)
+    expanded_items: list[dict] = []
+    for li in line_items:
+        logger.info("DEBUG line_item properties: %s", li.get("properties", []))
+        expanded = _expand_line_item_colors(li)
+        if len(expanded) > 1:
+            logger.info("Expanded line item '%s' into %d color variants", li.get("title"), len(expanded))
+        expanded_items.extend(expanded)
+
+    logger.info("Total subitems to create: %d (from %d line items)", len(expanded_items), len(line_items))
+
     success_count = 0
     fail_count = 0
-    for i, li in enumerate(line_items, 1):
-        product_title = li.get("title", "Unknown Product")
-        variant_title = (li.get("variant_title") or "").strip()
-
-        # Extract color from custom properties (Shopify plugin)
-        # Two known formats:
-        #   Spaces format: {'name': 'Color', 'value': 'Charcoal Grey'}  → color = value
-        #   Pro format:    {'name': 'Sweet Sage', 'value': '1'}         → color = name
-        color = ""
-        for prop in (li.get("properties") or []):
-            prop_name = (prop.get("name") or "").strip()
-            prop_value = (prop.get("value") or "").strip()
-
-            if prop_name.lower() == "color":
-                # Spaces format: name is "Color", value is the actual color
-                color = prop_value
-                break
-            elif prop_name and prop_value.isdigit():
-                # Pro format: name is the color, value is the quantity
-                color = prop_name
-                break
-
+    for i, item in enumerate(expanded_items, 1):
         # Build subitem name: Title - Variant - Color (skip empty parts)
-        parts = [product_title]
-        if variant_title:
-            parts.append(variant_title)
-        if color:
-            parts.append(color)
+        parts = [item["title"]]
+        if item["variant_title"]:
+            parts.append(item["variant_title"])
+        if item["color"]:
+            parts.append(item["color"])
         subitem_name = " - ".join(parts)
 
-        quantity = li.get("quantity", 1)
-        logger.info("Line item %d/%d: '%s' x%d", i, len(line_items), subitem_name, quantity)
-        logger.info("DEBUG line_item properties: %s", li.get("properties", []))
+        quantity = item["quantity"]
+        logger.info("Subitem %d/%d: '%s' x%d", i, len(expanded_items), subitem_name, quantity)
 
         sub_columns: dict = {}
         col_qty = get_subitem_col("quantity")
@@ -511,7 +536,7 @@ async def process_order(order: dict, store_key: str) -> None:
             fail_count += 1
 
     logger.info("=" * 60)
-    logger.info("ORDER %s COMPLETE: %d/%d subitems created successfully", order_name, success_count, len(line_items))
+    logger.info("ORDER %s COMPLETE: %d/%d subitems created successfully", order_name, success_count, len(expanded_items))
     if fail_count > 0:
         logger.error("ORDER %s: %d subitem(s) FAILED to create", order_name, fail_count)
     logger.info("=" * 60)
