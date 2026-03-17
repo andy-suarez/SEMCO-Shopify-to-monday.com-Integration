@@ -361,7 +361,7 @@ def map_shipping_type(order: dict) -> str | None:
         if "ups" in combined or "flat rate" in combined or "economy" in combined:
             logger.info("Shipping type mapped to: UPS")
             return "UPS"
-        if "ltl" in combined:
+        if "ltl" in combined or "r + l" in combined or "r+l" in combined:
             logger.info("Shipping type mapped to: LTL")
             return "LTL"
         if "will call" in combined or "pickup" in combined:
@@ -468,10 +468,21 @@ async def process_order(order: dict, store_key: str) -> None:
         variant_title = (li.get("variant_title") or "").strip()
 
         # Extract color from custom properties (Shopify plugin)
+        # Two known formats:
+        #   Spaces format: {'name': 'Color', 'value': 'Charcoal Grey'}  → color = value
+        #   Pro format:    {'name': 'Sweet Sage', 'value': '1'}         → color = name
         color = ""
         for prop in (li.get("properties") or []):
-            if (prop.get("name") or "").lower() == "color":
-                color = (prop.get("value") or "").strip()
+            prop_name = (prop.get("name") or "").strip()
+            prop_value = (prop.get("value") or "").strip()
+
+            if prop_name.lower() == "color":
+                # Spaces format: name is "Color", value is the actual color
+                color = prop_value
+                break
+            elif prop_name and prop_value.isdigit():
+                # Pro format: name is the color, value is the quantity
+                color = prop_name
                 break
 
         # Build subitem name: Title - Variant - Color (skip empty parts)
