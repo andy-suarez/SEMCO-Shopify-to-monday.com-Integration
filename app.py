@@ -46,7 +46,14 @@ STORES = {
         "secret": os.environ.get("SHOPIFY_SEMCO_CONNECT_SECRET", ""),
         "type_label": "SEMCO CONNECT",
     },
+    "semco_works": {
+        "secret": os.environ.get("SHOPIFY_SEMCO_WORKS_SECRET", ""),
+        "type_label": "SEMCO WORKS",
+    },
 }
+
+# SEMCOWorks only posts LTL and Will Call orders — all other shipping types are skipped
+SEMCO_WORKS_ALLOWED_SHIPPING = {"LTL", "WILL CALL"}
 
 MONDAY_API_URL = "https://api.monday.com/v2"
 
@@ -448,6 +455,13 @@ async def process_order(order: dict, store_key: str) -> None:
     if _is_sample_only_order(order):
         logger.info("SKIPPING ORDER %s: Contains only sample items — not posting to Monday.com", order_name)
         return
+
+    # SEMCOWorks: only post LTL and Will Call orders — skip everything else for now
+    if store_key == "semco_works":
+        shipment_type_check = map_shipping_type(order)
+        if shipment_type_check not in SEMCO_WORKS_ALLOWED_SHIPPING:
+            logger.info("SKIPPING ORDER %s from semco_works: Shipping type '%s' is not LTL or WILL CALL — skipped for now", order_name, shipment_type_check)
+            return
 
     contact = extract_contact_name(order)
     company = extract_company_name(order)
