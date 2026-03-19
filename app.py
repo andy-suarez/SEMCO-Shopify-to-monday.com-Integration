@@ -456,11 +456,24 @@ async def process_order(order: dict, store_key: str) -> None:
         logger.info("SKIPPING ORDER %s: Contains only sample items — not posting to Monday.com", order_name)
         return
 
-    # SEMCOWorks: only post LTL and Will Call orders — skip everything else for now
+    # SEMCOWorks: only post orders with explicit LTL or Will Call shipping — skip everything else
+    # Uses strict matching (no default fallback) so "Free Ground Shipping" etc. are skipped
     if store_key == "semco_works":
-        shipment_type_check = map_shipping_type(order)
-        if shipment_type_check not in SEMCO_WORKS_ALLOWED_SHIPPING:
-            logger.info("SKIPPING ORDER %s from semco_works: Shipping type '%s' is not LTL or WILL CALL — skipped for now", order_name, shipment_type_check)
+        shipping_lines = order.get("shipping_lines") or []
+        is_ltl_or_willcall = False
+        for line in shipping_lines:
+            title = (line.get("title") or "").lower()
+            code = (line.get("code") or "").lower()
+            combined = f"{title} {code}"
+            if "ltl" in combined or "r + l" in combined or "r+l" in combined:
+                is_ltl_or_willcall = True
+                break
+            if "will call" in combined or "pickup" in combined:
+                is_ltl_or_willcall = True
+                break
+        if not is_ltl_or_willcall:
+            ship_titles = [l.get("title", "unknown") for l in shipping_lines]
+            logger.info("SKIPPING ORDER %s from semco_works: Shipping '%s' is not explicitly LTL or WILL CALL — skipped", order_name, ship_titles)
             return
 
     contact = extract_contact_name(order)
