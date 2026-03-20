@@ -5,9 +5,12 @@ import hmac
 import json
 import logging
 import os
+import smtplib
 import time
 import zoneinfo
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -54,6 +57,11 @@ STORES = {
 
 # SEMCOWorks only posts LTL and Will Call orders — all other shipping types are skipped
 SEMCO_WORKS_ALLOWED_SHIPPING = {"LTL", "WILL CALL"}
+
+# Email notification settings (Gmail SMTP)
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+NOTIFY_EMAILS = [e.strip() for e in os.environ.get("NOTIFY_EMAILS", "").split(",") if e.strip()]
 
 MONDAY_API_URL = "https://api.monday.com/v2"
 
@@ -210,6 +218,83 @@ def verify_hmac(body: bytes, secret: str, header_hmac: str) -> bool:
         hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
     ).decode("utf-8")
     return hmac.compare_digest(computed, header_hmac)
+
+# ---------------------------------------------------------------------------
+# Email notifications
+# ---------------------------------------------------------------------------
+
+def _send_email(subject: str, body_html: str) -> None:
+    """Send an email notification via Gmail SMTP. Runs synchronously but is called from background tasks."""
+    if not SMTP_EMAIL or not SMTP_PASSWORD or not NOTIFY_EMAILS:
+        logger.debug("Email notifications not configured — skipping")
+        return
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = ", ".join(NOTIFY_EMAILS)
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body_html, "html"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.sendmail(SMTP_EMAIL, NOTIFY_EMAILS, msg.as_string())
+
+        logger.info("Email notification sent: %s", subject)
+    except Exception as e:
+        logger.error("Failed to send email notification: %s — %s", type(e).__name__, e)
+
+
+def send_success_email(store_key: str, order_name: str, item_name: str, subitems: list[str], shipment_type: str | None) -> None:
+    """Send a success notification for a posted order."""
+    store_label = STORES.get(store_key, {}).get("type_label", store_key)
+    now = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
+
+    subitems_html = "".join(f"<li>{s}</li>" for s in subitems)
+
+    body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px;">
+        <h2 style="color: #2e7d32;">✅ Order Posted Successfully</h2>
+        <table style="border-collapse: collapse; width: 100%;">
+            <tr><td style="padding: 8px; font-weight: bold;">Store:</td><td style="padding: 8px;">{store_label}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Order:</td><td style="padding: 8px;">{order_name}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Item Name:</td><td style="padding: 8px;">{item_name}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Shipment:</td><td style="padding: 8px;">{shipment_type or 'N/A'}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Time:</td><td style="padding: 8px;">{now}</td></tr>
+        </table>
+        <h3>Subitems Created:</h3>
+        <ul>{subitems_html}</ul>
+    </div>
+    """
+    subject = f"✅ Order Posted — {store_label} — {order_name}"
+    _send_email(subject, body)
+
+
+def send_failure_email(store_key: str, order_name: str, error_details: str, context: str = "") -> None:
+    """Send a failure notification when an order fails to post."""
+    store_label = STORES.get(store_key, {}).get("type_label", store_key)
+    now = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
+
+    context_html = f"<tr><td style='padding: 8px; font-weight: bold;'>Context:</td><td style='padding: 8px;'>{context}</td></tr>" if context else ""
+
+    body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px;">
+        <h2 style="color: #c62828;">⚠️ Order Failed to Post</h2>
+        <table style="border-collapse: collapse; width: 100%;">
+            <tr><td style="padding: 8px; font-weight: bold;">Store:</td><td style="padding: 8px;">{store_label}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Order:</td><td style="padding: 8px;">{order_name}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Time:</td><td style="padding: 8px;">{now}</td></tr>
+            {context_html}
+        </table>
+        <h3>Error Details:</h3>
+        <pre style="background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 13px;">{error_details}</pre>
+        <p style="color: #666; font-size: 12px;">Check Render logs for full details.</p>
+    </div>
+    """
+    subject = f"⚠️ Order FAILED — {store_label} — {order_name}"
+    _send_email(subject, body)
+
 
 # ---------------------------------------------------------------------------
 # Monday.com helpers
@@ -517,6 +602,7 @@ async def process_order(order: dict, store_key: str) -> None:
     parent_id = await create_parent_item(item_name, column_values)
     if not parent_id:
         logger.error("ABORTING ORDER %s: Failed to create parent item — subitems will not be created", order_name)
+        send_failure_email(store_key, order_name, "Failed to create parent item on Monday.com", context=f"Item name: {item_name}")
         return
 
     # Create subitems for each line item
@@ -537,6 +623,8 @@ async def process_order(order: dict, store_key: str) -> None:
 
     success_count = 0
     fail_count = 0
+    created_subitems: list[str] = []
+    failed_subitems: list[str] = []
     for i, item in enumerate(expanded_items, 1):
         # Build subitem name: Title - Variant - Color (skip empty parts)
         parts = [item["title"]]
@@ -547,6 +635,7 @@ async def process_order(order: dict, store_key: str) -> None:
         subitem_name = " - ".join(parts)
 
         quantity = item["quantity"]
+        subitem_display = f"{subitem_name} x{quantity}"
         logger.info("Subitem %d/%d: '%s' x%d", i, len(expanded_items), subitem_name, quantity)
 
         sub_columns: dict = {}
@@ -559,14 +648,27 @@ async def process_order(order: dict, store_key: str) -> None:
         result = await create_subitem(parent_id, subitem_name, sub_columns)
         if result:
             success_count += 1
+            created_subitems.append(subitem_display)
         else:
             fail_count += 1
+            failed_subitems.append(subitem_display)
 
     logger.info("=" * 60)
     logger.info("ORDER %s COMPLETE: %d/%d subitems created successfully", order_name, success_count, len(expanded_items))
     if fail_count > 0:
         logger.error("ORDER %s: %d subitem(s) FAILED to create", order_name, fail_count)
     logger.info("=" * 60)
+
+    # Email notifications
+    if fail_count == 0:
+        send_success_email(store_key, order_name, item_name, created_subitems, shipment_type)
+    else:
+        failed_list = "\n".join(failed_subitems)
+        send_failure_email(
+            store_key, order_name,
+            f"{fail_count}/{len(expanded_items)} subitems failed to create:\n{failed_list}",
+            context=f"Parent item '{item_name}' was created (ID: {parent_id}), but some subitems failed",
+        )
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -624,8 +726,9 @@ async def _safe_process_order(order: dict, store_key: str, order_name: str) -> N
     """Wrapper to catch and log any errors from background processing."""
     try:
         await process_order(order, store_key)
-    except Exception:
+    except Exception as e:
         logger.exception("UNHANDLED ERROR processing order %s from %s", order_name, store_key)
+        send_failure_email(store_key, order_name, f"Unhandled exception: {type(e).__name__}: {e}", context="Order processing crashed unexpectedly")
 
 
 @app.post("/test")
