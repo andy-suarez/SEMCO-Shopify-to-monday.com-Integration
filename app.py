@@ -397,6 +397,30 @@ async def create_subitem(parent_item_id: str, item_name: str, column_values: dic
         logger.error("FAILED: Could not create subitem '%s' under parent %s. Result: %s", item_name, parent_item_id, result)
         return None
 
+
+async def create_update(item_id: str, body_text: str) -> bool:
+    """Create an update (comment bubble) on a Monday.com item."""
+    query = """
+    mutation ($itemId: ID!, $body: String!) {
+        create_update(
+            item_id: $itemId,
+            body: $body
+        ) {
+            id
+        }
+    }
+    """
+    variables = {"itemId": item_id, "body": body_text}
+    logger.info("Creating update on item %s: '%s'", item_id, body_text[:100])
+    result = await monday_request(query, variables)
+    if result and "data" in result:
+        logger.info("SUCCESS: Created update on item %s", item_id)
+        return True
+    else:
+        logger.error("FAILED: Could not create update on item %s. Result: %s", item_id, result)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Order parsing helpers
 # ---------------------------------------------------------------------------
@@ -669,6 +693,20 @@ async def process_order(order: dict, store_key: str) -> None:
             f"{fail_count}/{len(expanded_items)} subitems failed to create:\n{failed_list}",
             context=f"Parent item '{item_name}' was created (ID: {parent_id}), but some subitems failed",
         )
+
+    # SEMCO Pro LTL orders: add SKU summary update bubble
+    if store_key == "semco_pro" and shipment_type == "LTL":
+        sku_counts: dict[str, int] = {}
+        for li in line_items:
+            sku = (li.get("sku") or "").strip()
+            qty = li.get("quantity", 1)
+            if sku:
+                sku_counts[sku] = sku_counts.get(sku, 0) + qty
+        if sku_counts:
+            sku_parts = [f"{qty}: {sku}" for sku, qty in sku_counts.items()]
+            update_text = ", ".join(sku_parts) + "\nWater Based Building Products"
+            logger.info("Adding SKU summary update for Pro LTL order %s: %s", order_name, update_text)
+            await create_update(parent_id, update_text)
 
 # ---------------------------------------------------------------------------
 # Endpoints
