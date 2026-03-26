@@ -35,6 +35,7 @@ app = FastAPI(title="Shopify → Monday.com Order Sync")
 # ---------------------------------------------------------------------------
 MONDAY_API_KEY = os.environ.get("MONDAY_API_KEY", "")
 MONDAY_BOARD_ID = os.environ.get("MONDAY_BOARD_ID", "")
+MONDAY_SAMPLE_BOARD_ID = os.environ.get("MONDAY_SAMPLE_BOARD_ID", "")
 
 STORES = {
     "semco_pro": {
@@ -207,6 +208,91 @@ def get_parent_col(key: str) -> str:
 
 def get_subitem_col(key: str) -> str:
     return _column_cache["subitem"].get(key, "")
+
+
+# ---------------------------------------------------------------------------
+# Sample board — group and column discovery
+# ---------------------------------------------------------------------------
+SAMPLE_LOG_GROUP_NAME = "Sample Requests Log"
+
+_sample_board_cache: dict = {
+    "board_id": None,
+    "log_group_id": None,         # Group ID for "Sample Requests Log"
+    "subitem_qty_col": None,      # Subitem Quantity1 column ID
+}
+
+
+async def _discover_sample_board() -> None:
+    """Discover group ID and subitem columns for the sample inventory board."""
+    board_id = MONDAY_SAMPLE_BOARD_ID
+    if not board_id:
+        return
+
+    if _sample_board_cache["board_id"] == board_id and _sample_board_cache["log_group_id"]:
+        return  # Already cached
+
+    logger.info("Discovering sample board structure for board %s ...", board_id)
+
+    # Discover groups
+    group_query = """
+    query ($boardId: [ID!]) {
+        boards(ids: $boardId) {
+            groups { id title }
+            columns { id title type settings_str }
+        }
+    }
+    """
+    result = await monday_request(group_query, {"boardId": [board_id]})
+    if not result or not result.get("data", {}).get("boards"):
+        logger.error("SAMPLE BOARD DISCOVERY FAILED: Board %s not found. Response: %s", board_id, result)
+        return
+
+    board_data = result["data"]["boards"][0]
+
+    # Find the Sample Requests Log group
+    log_group_id = None
+    for group in board_data.get("groups", []):
+        logger.info("  Found group: '%s' (ID: %s)", group["title"], group["id"])
+        if group["title"] == SAMPLE_LOG_GROUP_NAME:
+            log_group_id = group["id"]
+            logger.info("  MATCHED sample log group '%s' → ID: %s", SAMPLE_LOG_GROUP_NAME, log_group_id)
+
+    if not log_group_id:
+        logger.error("SAMPLE BOARD DISCOVERY FAILED: Group '%s' not found on board %s", SAMPLE_LOG_GROUP_NAME, board_id)
+
+    # Find subitem board and Quantity1 column
+    subitem_qty_col = None
+    subitem_board_id = None
+    for col in board_data.get("columns", []):
+        if col["type"] == "subtasks":
+            try:
+                settings = json.loads(col["settings_str"])
+                ids = settings.get("boardIds", [])
+                if ids:
+                    subitem_board_id = str(ids[0])
+                    logger.info("  Found sample subitem board ID: %s", subitem_board_id)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    if subitem_board_id:
+        col_query = """
+        query ($boardId: [ID!]) {
+            boards(ids: $boardId) {
+                columns { id title type }
+            }
+        }
+        """
+        sub_result = await monday_request(col_query, {"boardId": [subitem_board_id]})
+        if sub_result and sub_result.get("data", {}).get("boards"):
+            for col in sub_result["data"]["boards"][0]["columns"]:
+                if col["title"] == "Quantity1":
+                    subitem_qty_col = col["id"]
+                    logger.info("  MATCHED sample subitem column 'Quantity1' → ID: %s", subitem_qty_col)
+
+    _sample_board_cache["board_id"] = board_id
+    _sample_board_cache["log_group_id"] = log_group_id
+    _sample_board_cache["subitem_qty_col"] = subitem_qty_col
+    logger.info("Sample board discovery complete: log_group=%s, qty_col=%s", log_group_id, subitem_qty_col)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +507,101 @@ async def create_update(item_id: str, body_text: str) -> bool:
         return False
 
 
+async def create_item_in_group(board_id: str, group_id: str, item_name: str, column_values: dict | None = None) -> str | None:
+    """Create an item in a specific group on a Monday.com board."""
+    query = """
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnValues: JSON!) {
+        create_item(
+            board_id: $boardId,
+            group_id: $groupId,
+            item_name: $itemName,
+            column_values: $columnValues
+        ) {
+            id
+        }
+    }
+    """
+    col_values_json = json.dumps(column_values or {})
+    variables = {
+        "boardId": board_id,
+        "groupId": group_id,
+        "itemName": item_name,
+        "columnValues": col_values_json,
+    }
+    logger.info("Creating item in group: '%s' on board %s, group %s", item_name, board_id, group_id)
+    result = await monday_request(query, variables)
+    if result and "data" in result:
+        try:
+            item_id = result["data"]["create_item"]["id"]
+            logger.info("SUCCESS: Created item '%s' (ID: %s) in group %s", item_name, item_id, group_id)
+            return item_id
+        except (KeyError, TypeError) as e:
+            logger.error("FAILED: Unexpected response creating item '%s' in group: %s — Response: %s", item_name, e, result)
+            return None
+    else:
+        logger.error("FAILED: Could not create item '%s' in group %s. Result: %s", item_name, group_id, result)
+        return None
+
+
+async def log_sample_order(order: dict, store_key: str) -> None:
+    """Log a sample order to the Sample Requests Log group on the sample inventory board."""
+    if not MONDAY_SAMPLE_BOARD_ID:
+        logger.debug("MONDAY_SAMPLE_BOARD_ID not set — skipping sample order logging")
+        return
+
+    await _discover_sample_board()
+
+    log_group_id = _sample_board_cache.get("log_group_id")
+    if not log_group_id:
+        logger.error("Cannot log sample order — Sample Requests Log group not found on board %s", MONDAY_SAMPLE_BOARD_ID)
+        return
+
+    order_name = order.get("name", "Unknown")
+    contact = extract_contact_name(order)
+    company = extract_company_name(order)
+    if company:
+        item_name = f"{contact} / {company} / Order{order_name}"
+    else:
+        item_name = f"{contact} / Order{order_name}"
+
+    # Create parent item in the log group
+    parent_id = await create_item_in_group(MONDAY_SAMPLE_BOARD_ID, log_group_id, item_name)
+    if not parent_id:
+        logger.error("FAILED to log sample order %s to sample board", order_name)
+        return
+
+    # Create subitems for each sample line item with quantities
+    line_items = order.get("line_items") or []
+    subitem_qty_col = _sample_board_cache.get("subitem_qty_col")
+
+    for li in line_items:
+        title = (li.get("title") or "").strip()
+        # Only log sample items
+        if not any(sample in title.lower() for sample in SAMPLE_PRODUCT_NAMES):
+            continue
+
+        variant_title = (li.get("variant_title") or "").strip()
+
+        # Extract color (Spaces format)
+        color = ""
+        for prop in (li.get("properties") or []):
+            if (prop.get("name") or "").strip().lower() == "color":
+                color = (prop.get("value") or "").strip()
+                break
+
+        parts = [p for p in [title, variant_title, color] if p]
+        subitem_name = " - ".join(parts)
+        quantity = li.get("quantity", 1)
+
+        sub_columns: dict = {}
+        if subitem_qty_col:
+            sub_columns[subitem_qty_col] = str(quantity)
+
+        await create_subitem(parent_id, subitem_name, sub_columns)
+
+    logger.info("SAMPLE LOG: Order %s logged to Sample Requests Log on board %s", order_name, MONDAY_SAMPLE_BOARD_ID)
+
+
 # ---------------------------------------------------------------------------
 # Order parsing helpers
 # ---------------------------------------------------------------------------
@@ -562,7 +743,10 @@ async def process_order(order: dict, store_key: str) -> None:
 
     # Filter out sample-only orders
     if _is_sample_only_order(order):
-        logger.info("SKIPPING ORDER %s: Contains only sample items — not posting to Monday.com", order_name)
+        logger.info("SKIPPING ORDER %s: Contains only sample items — not posting to order board", order_name)
+        # Log sample orders from Spaces to the Sample Requests Log board
+        if store_key == "semco_spaces":
+            await log_sample_order(order, store_key)
         return
 
     # SEMCOWorks: only post orders with explicit LTL or Will Call shipping — skip everything else
