@@ -742,6 +742,17 @@ async def process_order(order: dict, store_key: str) -> None:
             await log_sample_order(order, store_key)
         return
 
+    # Mixed orders (samples + regular products): post full order to orders board AND
+    # log just the sample items to the sample inventory board
+    if store_key in ("semco_pro", "semco_spaces"):
+        has_samples = any(
+            any(sample in (li.get("title") or "").lower() for sample in SAMPLE_PRODUCT_NAMES)
+            for li in (order.get("line_items") or [])
+        )
+        if has_samples:
+            logger.info("Mixed order %s: contains samples + regular items — logging samples to sample board", order_name)
+            await log_sample_order(order, store_key)
+
     # SEMCOWorks: only post orders with explicit LTL or Will Call shipping — skip everything else
     # Uses strict matching (no default fallback) so "Free Ground Shipping" etc. are skipped
     if store_key == "semco_works":
