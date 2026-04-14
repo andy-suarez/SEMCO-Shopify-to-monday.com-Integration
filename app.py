@@ -580,24 +580,17 @@ async def log_sample_order(order: dict, store_key: str) -> None:
         if not any(sample in title.lower() for sample in SAMPLE_PRODUCT_NAMES):
             continue
 
-        variant_title = (li.get("variant_title") or "").strip()
+        # Use the same color expansion logic as regular orders (handles both Pro and Spaces formats)
+        expanded = _expand_line_item_colors(li)
+        for item in expanded:
+            parts = [p for p in [item["title"], item["variant_title"], item["color"]] if p]
+            subitem_name = " - ".join(parts)
 
-        # Extract color (Spaces format)
-        color = ""
-        for prop in (li.get("properties") or []):
-            if (prop.get("name") or "").strip().lower() == "color":
-                color = (prop.get("value") or "").strip()
-                break
+            sub_columns: dict = {}
+            if subitem_qty_col:
+                sub_columns[subitem_qty_col] = str(item["quantity"])
 
-        parts = [p for p in [title, variant_title, color] if p]
-        subitem_name = " - ".join(parts)
-        quantity = li.get("quantity", 1)
-
-        sub_columns: dict = {}
-        if subitem_qty_col:
-            sub_columns[subitem_qty_col] = str(quantity)
-
-        await create_subitem(parent_id, subitem_name, sub_columns)
+            await create_subitem(parent_id, subitem_name, sub_columns)
 
     logger.info("SAMPLE LOG: Order %s logged to Sample Requests Log on board %s", order_name, MONDAY_SAMPLE_BOARD_ID)
 
@@ -744,8 +737,8 @@ async def process_order(order: dict, store_key: str) -> None:
     # Filter out sample-only orders
     if _is_sample_only_order(order):
         logger.info("SKIPPING ORDER %s: Contains only sample items — not posting to order board", order_name)
-        # Log sample orders from Spaces to the Sample Requests Log board
-        if store_key == "semco_spaces":
+        # Log sample orders from Pro and Spaces to the Sample Requests Log board
+        if store_key in ("semco_pro", "semco_spaces"):
             await log_sample_order(order, store_key)
         return
 
