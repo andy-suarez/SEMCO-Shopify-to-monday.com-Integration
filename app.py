@@ -1166,13 +1166,10 @@ async def health():
     }
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    """Live sample inventory dashboard — embed in Monday.com via iframe widget."""
-
-    # Query the sample board for all inventory subitems with current values
+async def _fetch_sample_inventory_data() -> list[dict] | None:
+    """Query the sample board and return a flat list of all inventory color items."""
     if not MONDAY_SAMPLE_BOARD_ID:
-        return HTMLResponse("<h2>MONDAY_SAMPLE_BOARD_ID not configured</h2>", status_code=500)
+        return None
 
     board_id = MONDAY_SAMPLE_BOARD_ID
     query = """
@@ -1193,15 +1190,13 @@ async def dashboard():
     """
     result = await monday_request(query, {"boardId": [board_id]})
     if not result or not result.get("data", {}).get("boards"):
-        return HTMLResponse("<h2>Failed to load sample board data</h2>", status_code=500)
+        return None
 
-    # Discover column IDs (Quantity, Times Ordered) for matching
     await _discover_sample_board()
     qty_col = _sample_board_cache.get("subitem_qty_col")
     times_col = _sample_board_cache.get("subitem_times_col")
     logger.info("DASHBOARD: qty_col=%s, times_col=%s", qty_col, times_col)
 
-    # Build flat list of all inventory colors
     all_items: list[dict] = []
     board_items = result["data"]["boards"][0]["items_page"]["items"]
     logger.info("DASHBOARD: Found %d items on board", len(board_items))
@@ -1240,66 +1235,10 @@ async def dashboard():
             })
 
     logger.info("DASHBOARD: %d total inventory items, %d in stock", len(all_items), sum(1 for i in all_items if i["quantity"] > 0))
+    return all_items
 
-    # Filter and sort
-    in_stock = sorted([i for i in all_items if i["quantity"] > 0], key=lambda x: (-x["quantity"], x["label"]))
-    top_requested = sorted([i for i in all_items if i["times_ordered"] > 0], key=lambda x: -x["times_ordered"])[:10]
 
-    now_pt = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
-
-    # Build inventory rows
-    inv_rows = ""
-    for item in in_stock:
-        bar_width = min(item["quantity"] * 8, 100)
-        inv_rows += f"""
-        <tr>
-            <td class="label-cell">{item["label"]}</td>
-            <td class="qty-cell">
-                <div class="bar-container">
-                    <div class="bar" style="width: {bar_width}%"></div>
-                    <span class="bar-value">{item["quantity"]}</span>
-                </div>
-            </td>
-        </tr>"""
-
-    if not inv_rows:
-        inv_rows = '<tr><td colspan="2" class="empty">No items in stock</td></tr>'
-
-    # Build top 10 rows
-    top_rows = ""
-    max_times = top_requested[0]["times_ordered"] if top_requested else 1
-    for i, item in enumerate(top_requested, 1):
-        bar_width = (item["times_ordered"] / max_times) * 100
-        medal = ""
-        if i == 1:
-            medal = ' <span class="medal gold">1st</span>'
-        elif i == 2:
-            medal = ' <span class="medal silver">2nd</span>'
-        elif i == 3:
-            medal = ' <span class="medal bronze">3rd</span>'
-
-        top_rows += f"""
-        <tr>
-            <td class="rank-cell">{i}</td>
-            <td class="label-cell">{item["label"]}{medal}</td>
-            <td class="qty-cell">
-                <div class="bar-container">
-                    <div class="bar top-bar" style="width: {bar_width}%"></div>
-                    <span class="bar-value">{item["times_ordered"]}</span>
-                </div>
-            </td>
-        </tr>"""
-
-    if not top_rows:
-        top_rows = '<tr><td colspan="3" class="empty">No sample orders recorded yet</td></tr>'
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sample Inventory Dashboard</title>
-    <style>
+DASHBOARD_CSS = """
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -1307,22 +1246,14 @@ async def dashboard():
             color: #e0e0e0;
             padding: 24px;
         }}
-        .dashboard {{
-            max-width: 1200px;
-            margin: 0 auto;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 24px;
-        }}
-        @media (max-width: 900px) {{
-            .dashboard {{ grid-template-columns: 1fr; }}
-        }}
         .card {{
             background: #16213e;
             border-radius: 8px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.3);
             overflow: hidden;
             border: 1px solid #2a2a4a;
+            max-width: 700px;
+            margin: 0 auto;
         }}
         .card-header {{
             padding: 16px 20px;
@@ -1346,7 +1277,7 @@ async def dashboard():
             border-radius: 10px;
         }}
         .card-body {{
-            max-height: 520px;
+            max-height: 600px;
             overflow-y: auto;
         }}
         table {{
@@ -1369,10 +1300,6 @@ async def dashboard():
         .label-cell {{
             color: #e0e0e0;
             font-weight: 500;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 300px;
         }}
         .rank-cell {{
             color: #a0a0b8;
@@ -1428,37 +1355,118 @@ async def dashboard():
             padding: 12px;
             margin-top: 16px;
         }}
-    </style>
+"""
+
+
+@app.get("/dashboard/inventory", response_class=HTMLResponse)
+async def dashboard_inventory():
+    """Inventory quick view — all colors with stock > 0."""
+    all_items = await _fetch_sample_inventory_data()
+    if all_items is None:
+        return HTMLResponse("<h2>Failed to load sample board data</h2>", status_code=500)
+
+    in_stock = sorted([i for i in all_items if i["quantity"] > 0], key=lambda x: (-x["quantity"], x["label"]))
+    now_pt = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
+
+    rows = ""
+    for item in in_stock:
+        bar_width = min(item["quantity"] * 8, 100)
+        rows += f"""
+        <tr>
+            <td class="label-cell">{item["label"]}</td>
+            <td class="qty-cell">
+                <div class="bar-container">
+                    <div class="bar" style="width: {bar_width}%"></div>
+                    <span class="bar-value">{item["quantity"]}</span>
+                </div>
+            </td>
+        </tr>"""
+
+    if not rows:
+        rows = '<tr><td colspan="2" class="empty">No items in stock</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory — In Stock</title>
+    <style>{DASHBOARD_CSS}</style>
 </head>
 <body>
-    <div class="dashboard">
-        <div class="card">
-            <div class="card-header">
-                <h2>Inventory — In Stock</h2>
-                <span class="count">{len(in_stock)} items</span>
-            </div>
-            <div class="card-body">
-                <table>
-                    {inv_rows}
-                </table>
-            </div>
+    <div class="card">
+        <div class="card-header">
+            <h2>Inventory — In Stock</h2>
+            <span class="count">{len(in_stock)} items</span>
         </div>
-        <div class="card">
-            <div class="card-header">
-                <h2>Top 10 Most Requested</h2>
-                <span class="count">all time</span>
-            </div>
-            <div class="card-body">
-                <table>
-                    {top_rows}
-                </table>
-            </div>
+        <div class="card-body">
+            <table>{rows}</table>
         </div>
     </div>
     <div class="updated">Last updated: {now_pt}</div>
 </body>
 </html>"""
+    return HTMLResponse(html)
 
+
+@app.get("/dashboard/top-requested", response_class=HTMLResponse)
+async def dashboard_top_requested():
+    """Top 10 most requested samples — sorted by Times Ordered descending."""
+    all_items = await _fetch_sample_inventory_data()
+    if all_items is None:
+        return HTMLResponse("<h2>Failed to load sample board data</h2>", status_code=500)
+
+    top_requested = sorted([i for i in all_items if i["times_ordered"] > 0], key=lambda x: -x["times_ordered"])[:10]
+    now_pt = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
+
+    rows = ""
+    max_times = top_requested[0]["times_ordered"] if top_requested else 1
+    for i, item in enumerate(top_requested, 1):
+        bar_width = (item["times_ordered"] / max_times) * 100
+        medal = ""
+        if i == 1:
+            medal = ' <span class="medal gold">1st</span>'
+        elif i == 2:
+            medal = ' <span class="medal silver">2nd</span>'
+        elif i == 3:
+            medal = ' <span class="medal bronze">3rd</span>'
+
+        rows += f"""
+        <tr>
+            <td class="rank-cell">{i}</td>
+            <td class="label-cell">{item["label"]}{medal}</td>
+            <td class="qty-cell">
+                <div class="bar-container">
+                    <div class="bar top-bar" style="width: {bar_width}%"></div>
+                    <span class="bar-value">{item["times_ordered"]}</span>
+                </div>
+            </td>
+        </tr>"""
+
+    if not rows:
+        rows = '<tr><td colspan="3" class="empty">No sample orders recorded yet</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Top 10 Most Requested</title>
+    <style>{DASHBOARD_CSS}</style>
+</head>
+<body>
+    <div class="card">
+        <div class="card-header">
+            <h2>Top 10 Most Requested</h2>
+            <span class="count">all time</span>
+        </div>
+        <div class="card-body">
+            <table>{rows}</table>
+        </div>
+    </div>
+    <div class="updated">Last updated: {now_pt}</div>
+</body>
+</html>"""
     return HTMLResponse(html)
 
 
