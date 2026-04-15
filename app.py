@@ -1262,8 +1262,7 @@ DASHBOARD_CSS = """
             margin: 0 auto;
         }
         .card-body {
-            max-height: 600px;
-            overflow-y: auto;
+            overflow: visible;
         }
         table {
             width: 100%;
@@ -1339,17 +1338,6 @@ DASHBOARD_CSS = """
             color: #ffffff !important;
             min-width: 24px;
         }
-        .medal {
-            font-size: 10px;
-            font-weight: 700;
-            padding: 1px 5px;
-            border-radius: 3px;
-            margin-left: 4px;
-            vertical-align: middle;
-        }
-        .gold { background: #4a3f1f; color: #ffd700 !important; }
-        .silver { background: #3a3a4a; color: #c0c0c0 !important; }
-        .bronze { background: #3d2f1f; color: #cd7f32 !important; }
         .empty {
             text-align: center;
             color: #888 !important;
@@ -1429,18 +1417,11 @@ async def dashboard_top_requested():
     max_times = top_requested[0]["times_ordered"] if top_requested else 1
     for i, item in enumerate(top_requested, 1):
         bar_width = (item["times_ordered"] / max_times) * 100
-        medal = ""
-        if i == 1:
-            medal = ' <span class="medal gold">1st</span>'
-        elif i == 2:
-            medal = ' <span class="medal silver">2nd</span>'
-        elif i == 3:
-            medal = ' <span class="medal bronze">3rd</span>'
 
         rows += f"""
         <tr>
             <td class="rank-cell">{i}</td>
-            <td class="label-cell">{item["label"]}{medal}</td>
+            <td class="label-cell">{item["label"]}</td>
             <td class="qty-cell">
                 <div class="bar-container">
                     <div class="bar top-bar" style="width: {bar_width}%"></div>
