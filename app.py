@@ -1195,14 +1195,18 @@ async def dashboard():
     if not result or not result.get("data", {}).get("boards"):
         return HTMLResponse("<h2>Failed to load sample board data</h2>", status_code=500)
 
-    # Also discover column IDs if needed (for matching qty/times columns)
+    # Discover column IDs (Quantity, Times Ordered) for matching
     await _discover_sample_board()
     qty_col = _sample_board_cache.get("subitem_qty_col")
     times_col = _sample_board_cache.get("subitem_times_col")
+    logger.info("DASHBOARD: qty_col=%s, times_col=%s", qty_col, times_col)
 
     # Build flat list of all inventory colors
     all_items: list[dict] = []
-    for item in result["data"]["boards"][0]["items_page"]["items"]:
+    board_items = result["data"]["boards"][0]["items_page"]["items"]
+    logger.info("DASHBOARD: Found %d items on board", len(board_items))
+
+    for item in board_items:
         group_title = item.get("group", {}).get("title", "")
         if group_title != SAMPLE_INVENTORY_GROUP_NAME:
             continue
@@ -1212,14 +1216,18 @@ async def dashboard():
             qty = 0
             times_ordered = 0
             for cv in sub.get("column_values", []):
-                if cv["id"] == qty_col and cv.get("text"):
+                col_id = cv.get("id", "")
+                val = cv.get("text", "")
+                if not val:
+                    continue
+                if qty_col and col_id == qty_col:
                     try:
-                        qty = int(float(cv["text"]))
+                        qty = int(float(val))
                     except (ValueError, TypeError):
                         pass
-                elif times_col and cv["id"] == times_col and cv.get("text"):
+                elif times_col and col_id == times_col:
                     try:
-                        times_ordered = int(float(cv["text"]))
+                        times_ordered = int(float(val))
                     except (ValueError, TypeError):
                         pass
 
@@ -1230,6 +1238,8 @@ async def dashboard():
                 "quantity": qty,
                 "times_ordered": times_ordered,
             })
+
+    logger.info("DASHBOARD: %d total inventory items, %d in stock", len(all_items), sum(1 for i in all_items if i["quantity"] > 0))
 
     # Filter and sort
     in_stock = sorted([i for i in all_items if i["quantity"] > 0], key=lambda x: (-x["quantity"], x["label"]))
@@ -1293,8 +1303,8 @@ async def dashboard():
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #f6f7fb;
-            color: #323338;
+            background: #1a1a2e;
+            color: #e0e0e0;
             padding: 24px;
         }}
         .dashboard {{
@@ -1308,14 +1318,15 @@ async def dashboard():
             .dashboard {{ grid-template-columns: 1fr; }}
         }}
         .card {{
-            background: #fff;
+            background: #16213e;
             border-radius: 8px;
-            box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
             overflow: hidden;
+            border: 1px solid #2a2a4a;
         }}
         .card-header {{
             padding: 16px 20px;
-            border-bottom: 1px solid #e6e9ef;
+            border-bottom: 1px solid #2a2a4a;
             display: flex;
             align-items: center;
             gap: 10px;
@@ -1323,15 +1334,12 @@ async def dashboard():
         .card-header h2 {{
             font-size: 16px;
             font-weight: 600;
-            color: #323338;
-        }}
-        .card-header .icon {{
-            font-size: 20px;
+            color: #e0e0e0;
         }}
         .card-header .count {{
             margin-left: auto;
-            background: #e6e9ef;
-            color: #676879;
+            background: #2a2a4a;
+            color: #a0a0b8;
             font-size: 12px;
             font-weight: 600;
             padding: 2px 8px;
@@ -1346,20 +1354,20 @@ async def dashboard():
             border-collapse: collapse;
         }}
         tr {{
-            border-bottom: 1px solid #f0f1f3;
+            border-bottom: 1px solid #2a2a4a;
         }}
         tr:last-child {{
             border-bottom: none;
         }}
         tr:hover {{
-            background: #f6f7fb;
+            background: #1e2a4a;
         }}
         td {{
             padding: 10px 16px;
             font-size: 13px;
         }}
         .label-cell {{
-            color: #323338;
+            color: #e0e0e0;
             font-weight: 500;
             white-space: nowrap;
             overflow: hidden;
@@ -1367,7 +1375,7 @@ async def dashboard():
             max-width: 300px;
         }}
         .rank-cell {{
-            color: #676879;
+            color: #a0a0b8;
             font-weight: 600;
             width: 32px;
             text-align: center;
@@ -1393,7 +1401,7 @@ async def dashboard():
         .bar-value {{
             font-weight: 700;
             font-size: 13px;
-            color: #323338;
+            color: #e0e0e0;
             min-width: 24px;
         }}
         .medal {{
@@ -1404,18 +1412,18 @@ async def dashboard():
             margin-left: 4px;
             vertical-align: middle;
         }}
-        .gold {{ background: #fff3cd; color: #856404; }}
-        .silver {{ background: #e9ecef; color: #495057; }}
-        .bronze {{ background: #fde2cc; color: #8b4513; }}
+        .gold {{ background: #4a3f1f; color: #ffd700; }}
+        .silver {{ background: #3a3a4a; color: #c0c0c0; }}
+        .bronze {{ background: #3d2f1f; color: #cd7f32; }}
         .empty {{
             text-align: center;
-            color: #999;
+            color: #666;
             padding: 32px 16px;
             font-style: italic;
         }}
         .updated {{
             text-align: center;
-            color: #999;
+            color: #666;
             font-size: 11px;
             padding: 12px;
             margin-top: 16px;
@@ -1426,7 +1434,6 @@ async def dashboard():
     <div class="dashboard">
         <div class="card">
             <div class="card-header">
-                <span class="icon">📦</span>
                 <h2>Inventory — In Stock</h2>
                 <span class="count">{len(in_stock)} items</span>
             </div>
@@ -1438,7 +1445,6 @@ async def dashboard():
         </div>
         <div class="card">
             <div class="card-header">
-                <span class="icon">🔥</span>
                 <h2>Top 10 Most Requested</h2>
                 <span class="count">all time</span>
             </div>
