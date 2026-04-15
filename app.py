@@ -230,7 +230,9 @@ _sample_board_cache: dict = {
     "board_id": None,
     "log_group_id": None,         # Group ID for "Sample Requests Log"
     "subitem_board_id": None,     # Subitem board ID for the sample board
-    "subitem_qty_col": None,      # Subitem Quantity1 column ID (numbers6)
+    "subitem_qty_col": None,      # Subitem Quantity column ID (numbers6)
+    "subitem_label_col": None,    # Subitem Label column ID (text — "X-BOND Corsa/Smooth — Mojave")
+    "subitem_times_col": None,    # Subitem Times Ordered column ID (numbers — running counter)
     "inventory": {},              # {"Corsa/Smooth": {"item_id": "123", "colors": {"rawhide": {...}, ...}}, ...}
 }
 
@@ -273,8 +275,10 @@ async def _discover_sample_board() -> None:
     if not log_group_id:
         logger.error("SAMPLE BOARD DISCOVERY FAILED: Group '%s' not found on board %s", SAMPLE_LOG_GROUP_NAME, board_id)
 
-    # Find subitem board and quantity column
+    # Find subitem board and columns (Quantity, Label, Times Ordered)
     subitem_qty_col = None
+    subitem_label_col = None
+    subitem_times_col = None
     subitem_board_id = None
     for col in board_data.get("columns", []):
         if col["type"] == "subtasks":
@@ -298,12 +302,20 @@ async def _discover_sample_board() -> None:
         sub_result = await monday_request(col_query, {"boardId": [subitem_board_id]})
         if sub_result and sub_result.get("data", {}).get("boards"):
             for col in sub_result["data"]["boards"][0]["columns"]:
-                if col["title"] == "Quantity1":
+                if col["title"] == "Quantity":
                     subitem_qty_col = col["id"]
-                    logger.info("  MATCHED sample subitem column 'Quantity1' → ID: %s", subitem_qty_col)
+                    logger.info("  MATCHED sample subitem column 'Quantity' → ID: %s", subitem_qty_col)
+                elif col["title"] == "Label":
+                    subitem_label_col = col["id"]
+                    logger.info("  MATCHED sample subitem column 'Label' → ID: %s", subitem_label_col)
+                elif col["title"] == "Times Ordered":
+                    subitem_times_col = col["id"]
+                    logger.info("  MATCHED sample subitem column 'Times Ordered' → ID: %s", subitem_times_col)
 
     # Discover inventory items and their color subitems
     inventory: dict = {}
+    labels_to_populate: list[dict] = []  # Subitems that need their Label column set
+
     items_query = """
     query ($boardId: [ID!]) {
         boards(ids: $boardId) {
@@ -333,19 +345,41 @@ async def _discover_sample_board() -> None:
                 if texture_label.lower() in item_name.lower():
                     colors: dict = {}
                     for sub in item.get("subitems", []):
-                        # Get current quantity from column values
+                        # Get current quantity and label from column values
                         current_qty = 0
+                        current_label = ""
+                        current_times = 0
                         for cv in sub.get("column_values", []):
-                            if cv.get("text"):
+                            if cv["id"] == subitem_qty_col and cv.get("text"):
                                 try:
                                     current_qty = int(float(cv["text"]))
                                 except (ValueError, TypeError):
                                     pass
+                            elif cv["id"] == subitem_label_col:
+                                current_label = (cv.get("text") or "").strip()
+                            elif cv["id"] == subitem_times_col and cv.get("text"):
+                                try:
+                                    current_times = int(float(cv["text"]))
+                                except (ValueError, TypeError):
+                                    pass
+
+                        # Build the expected label: "X-BOND Corsa/Smooth — Mojave"
+                        expected_label = f"{item_name} — {sub['name']}"
+
                         colors[sub["name"].strip().lower()] = {
                             "id": sub["id"],
                             "name": sub["name"],
                             "quantity": current_qty,
+                            "times_ordered": current_times,
                         }
+
+                        # Queue label population if empty or different
+                        if subitem_label_col and current_label != expected_label:
+                            labels_to_populate.append({
+                                "subitem_id": sub["id"],
+                                "label": expected_label,
+                            })
+
                     inventory[texture_label] = {
                         "item_id": item["id"],
                         "item_name": item_name,
@@ -358,9 +392,33 @@ async def _discover_sample_board() -> None:
     _sample_board_cache["log_group_id"] = log_group_id
     _sample_board_cache["subitem_board_id"] = subitem_board_id
     _sample_board_cache["subitem_qty_col"] = subitem_qty_col
+    _sample_board_cache["subitem_label_col"] = subitem_label_col
+    _sample_board_cache["subitem_times_col"] = subitem_times_col
     _sample_board_cache["inventory"] = inventory
-    logger.info("Sample board discovery complete: log_group=%s, subitem_board=%s, qty_col=%s, inventory_items=%d",
-                log_group_id, subitem_board_id, subitem_qty_col, len(inventory))
+    logger.info("Sample board discovery complete: log_group=%s, subitem_board=%s, qty_col=%s, label_col=%s, times_col=%s, inventory_items=%d",
+                log_group_id, subitem_board_id, subitem_qty_col, subitem_label_col, subitem_times_col, len(inventory))
+
+    # Populate Label column for any subitems that are missing it
+    if labels_to_populate and subitem_board_id and subitem_label_col:
+        logger.info("Populating Label column for %d subitems...", len(labels_to_populate))
+        for entry in labels_to_populate:
+            update_query = """
+            mutation ($boardId: ID!, $itemId: ID!, $columnId: String!, $value: JSON!) {
+                change_column_value(
+                    board_id: $boardId,
+                    item_id: $itemId,
+                    column_id: $columnId,
+                    value: $value
+                ) { id }
+            }
+            """
+            await monday_request(update_query, {
+                "boardId": subitem_board_id,
+                "itemId": entry["subitem_id"],
+                "columnId": subitem_label_col,
+                "value": json.dumps(entry["label"]),
+            })
+        logger.info("Label column populated for %d subitems", len(labels_to_populate))
 
 
 async def _decrement_sample_inventory(color: str, texture: str, quantity: int, order_name: str) -> None:
@@ -390,7 +448,8 @@ async def _decrement_sample_inventory(color: str, texture: str, quantity: int, o
         logger.warning("INVENTORY DECREMENT SKIPPED: Color '%s' not found under '%s' (order %s)", color, texture, order_name)
         return
 
-    # Read current value from Monday.com (fresh read to avoid stale cache)
+    # Read current values from Monday.com (fresh read to avoid stale cache)
+    times_col = _sample_board_cache.get("subitem_times_col")
     read_query = """
     query ($itemId: [ID!]) {
         items(ids: $itemId) {
@@ -400,6 +459,7 @@ async def _decrement_sample_inventory(color: str, texture: str, quantity: int, o
     """
     read_result = await monday_request(read_query, {"itemId": [color_data["id"]]})
     current_qty = color_data["quantity"]  # Fallback to cached value
+    current_times = color_data.get("times_ordered", 0)
     if read_result and read_result.get("data", {}).get("items"):
         for cv in read_result["data"]["items"][0].get("column_values", []):
             if cv["id"] == qty_col and cv.get("text"):
@@ -407,10 +467,16 @@ async def _decrement_sample_inventory(color: str, texture: str, quantity: int, o
                     current_qty = int(float(cv["text"]))
                 except (ValueError, TypeError):
                     pass
+            elif times_col and cv["id"] == times_col and cv.get("text"):
+                try:
+                    current_times = int(float(cv["text"]))
+                except (ValueError, TypeError):
+                    pass
 
     new_qty = max(0, current_qty - quantity)
+    new_times = current_times + quantity
 
-    # Update the subitem quantity
+    # Update the subitem quantity and times ordered
     subitem_board_id = _sample_board_cache.get("subitem_board_id")
     if not subitem_board_id:
         logger.error("INVENTORY DECREMENT FAILED: Could not find subitem board ID")
@@ -438,10 +504,24 @@ async def _decrement_sample_inventory(color: str, texture: str, quantity: int, o
     if result:
         logger.info("INVENTORY DECREMENTED: %s / %s: %d → %d (-%d) for order %s",
                      texture, color_data["name"], current_qty, new_qty, quantity, order_name)
-        # Update cache
         color_data["quantity"] = new_qty
     else:
         logger.error("INVENTORY DECREMENT FAILED: %s / %s for order %s", texture, color, order_name)
+
+    # Increment Times Ordered counter
+    if times_col and subitem_board_id:
+        times_result = await monday_request(update_query, {
+            "boardId": subitem_board_id,
+            "itemId": color_data["id"],
+            "columnId": times_col,
+            "value": json.dumps(str(new_times)),
+        })
+        if times_result:
+            logger.info("TIMES ORDERED INCREMENTED: %s / %s: %d → %d (+%d) for order %s",
+                         texture, color_data["name"], current_times, new_times, quantity, order_name)
+            color_data["times_ordered"] = new_times
+        else:
+            logger.error("TIMES ORDERED INCREMENT FAILED: %s / %s for order %s", texture, color, order_name)
 
 
 # ---------------------------------------------------------------------------
