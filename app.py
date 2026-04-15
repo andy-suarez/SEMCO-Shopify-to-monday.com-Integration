@@ -1207,6 +1207,12 @@ async def _fetch_sample_inventory_data() -> list[dict] | None:
             continue
 
         parent_name = item["name"]
+        # Strip "Flex Samples - " prefix for cleaner display
+        display_name = parent_name
+        if display_name.startswith("Flex Samples - "):
+            display_name = display_name[len("Flex Samples - "):]
+        elif display_name == "Custom Flex Samples":
+            display_name = "Custom"
         for sub in item.get("subitems", []):
             qty = 0
             times_ordered = 0
@@ -1227,7 +1233,7 @@ async def _fetch_sample_inventory_data() -> list[dict] | None:
                         pass
 
             all_items.append({
-                "label": f"{parent_name} — {sub['name']}",
+                "label": f"{display_name} — {sub['name']}",
                 "color": sub["name"],
                 "parent": parent_name,
                 "quantity": qty,
@@ -1255,27 +1261,6 @@ DASHBOARD_CSS = """
             max-width: 700px;
             margin: 0 auto;
         }
-        .card-header {
-            padding: 16px 20px;
-            border-bottom: 1px solid #2a2a4a;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .card-header h2 {
-            font-size: 16px;
-            font-weight: 600;
-            color: #ffffff !important;
-        }
-        .card-header .count {
-            margin-left: auto;
-            background: #2a2a4a;
-            color: #a0a0b8 !important;
-            font-size: 12px;
-            font-weight: 600;
-            padding: 2px 8px;
-            border-radius: 10px;
-        }
         .card-body {
             max-height: 600px;
             overflow-y: auto;
@@ -1284,13 +1269,35 @@ DASHBOARD_CSS = """
             width: 100%;
             border-collapse: collapse;
         }
+        thead th {
+            padding: 10px 16px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #a0a0b8 !important;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            text-align: left;
+            border-bottom: 2px solid #2a2a4a;
+            background: #16213e !important;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        thead th.qty-header {
+            text-align: right;
+            width: 120px;
+        }
+        thead th.rank-header {
+            width: 32px;
+            text-align: center;
+        }
         tr {
             border-bottom: 1px solid #2a2a4a;
         }
         tr:last-child {
             border-bottom: none;
         }
-        tr:hover {
+        tbody tr:hover {
             background: #1e2a4a;
         }
         td {
@@ -1367,6 +1374,7 @@ async def dashboard_inventory():
         return HTMLResponse("<h2>Failed to load sample board data</h2>", status_code=500)
 
     in_stock = sorted([i for i in all_items if i["quantity"] > 0], key=lambda x: (-x["quantity"], x["label"]))
+    total_qty = sum(i["quantity"] for i in in_stock)
     now_pt = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
 
     rows = ""
@@ -1388,16 +1396,18 @@ async def dashboard_inventory():
 
     html = ("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-            "<title>Inventory — In Stock</title><style>"
+            "<title>Inventory</title><style>"
             + DASHBOARD_CSS
             + "</style></head><body>"
             + f"""<div class="card">
-        <div class="card-header">
-            <h2>Inventory — In Stock</h2>
-            <span class="count">{len(in_stock)} items</span>
-        </div>
         <div class="card-body">
-            <table>{rows}</table>
+            <table>
+                <thead><tr>
+                    <th>Sample</th>
+                    <th class="qty-header">Stock ({total_qty})</th>
+                </tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
         </div>
     </div>
     <div class="updated">Last updated: {now_pt}</div>
@@ -1407,12 +1417,12 @@ async def dashboard_inventory():
 
 @app.get("/dashboard/top-requested", response_class=HTMLResponse)
 async def dashboard_top_requested():
-    """Top 10 most requested samples — sorted by Times Ordered descending."""
+    """Most requested samples — sorted by Times Ordered descending, no limit."""
     all_items = await _fetch_sample_inventory_data()
     if all_items is None:
         return HTMLResponse("<h2>Failed to load sample board data</h2>", status_code=500)
 
-    top_requested = sorted([i for i in all_items if i["times_ordered"] > 0], key=lambda x: -x["times_ordered"])[:10]
+    top_requested = sorted([i for i in all_items if i["times_ordered"] > 0], key=lambda x: -x["times_ordered"])
     now_pt = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
 
     rows = ""
@@ -1444,16 +1454,19 @@ async def dashboard_top_requested():
 
     html = ("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-            "<title>Top 10 Most Requested</title><style>"
+            "<title>Most Requested Samples</title><style>"
             + DASHBOARD_CSS
             + "</style></head><body>"
             + f"""<div class="card">
-        <div class="card-header">
-            <h2>Top 10 Most Requested</h2>
-            <span class="count">all time</span>
-        </div>
         <div class="card-body">
-            <table>{rows}</table>
+            <table>
+                <thead><tr>
+                    <th class="rank-header">#</th>
+                    <th>Sample</th>
+                    <th class="qty-header">Times Ordered</th>
+                </tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
         </div>
     </div>
     <div class="updated">Last updated: {now_pt}</div>
