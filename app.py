@@ -1239,122 +1239,123 @@ async def _fetch_sample_inventory_data() -> list[dict] | None:
 
 
 DASHBOARD_CSS = """
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e;
-            color: #e0e0e0;
+            background: #1a1a2e !important;
+            color: #ffffff !important;
             padding: 24px;
-        }}
-        .card {{
-            background: #16213e;
+        }
+        .card {
+            background: #16213e !important;
             border-radius: 8px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.3);
             overflow: hidden;
             border: 1px solid #2a2a4a;
             max-width: 700px;
             margin: 0 auto;
-        }}
-        .card-header {{
+        }
+        .card-header {
             padding: 16px 20px;
             border-bottom: 1px solid #2a2a4a;
             display: flex;
             align-items: center;
             gap: 10px;
-        }}
-        .card-header h2 {{
+        }
+        .card-header h2 {
             font-size: 16px;
             font-weight: 600;
-            color: #e0e0e0;
-        }}
-        .card-header .count {{
+            color: #ffffff !important;
+        }
+        .card-header .count {
             margin-left: auto;
             background: #2a2a4a;
-            color: #a0a0b8;
+            color: #a0a0b8 !important;
             font-size: 12px;
             font-weight: 600;
             padding: 2px 8px;
             border-radius: 10px;
-        }}
-        .card-body {{
+        }
+        .card-body {
             max-height: 600px;
             overflow-y: auto;
-        }}
-        table {{
+        }
+        table {
             width: 100%;
             border-collapse: collapse;
-        }}
-        tr {{
+        }
+        tr {
             border-bottom: 1px solid #2a2a4a;
-        }}
-        tr:last-child {{
+        }
+        tr:last-child {
             border-bottom: none;
-        }}
-        tr:hover {{
+        }
+        tr:hover {
             background: #1e2a4a;
-        }}
-        td {{
+        }
+        td {
             padding: 10px 16px;
             font-size: 13px;
-        }}
-        .label-cell {{
-            color: #e0e0e0;
+            color: #ffffff !important;
+        }
+        .label-cell {
+            color: #ffffff !important;
             font-weight: 500;
-        }}
-        .rank-cell {{
-            color: #a0a0b8;
+        }
+        .rank-cell {
+            color: #a0a0b8 !important;
             font-weight: 600;
             width: 32px;
             text-align: center;
-        }}
-        .qty-cell {{
+        }
+        .qty-cell {
             width: 120px;
-        }}
-        .bar-container {{
+        }
+        .bar-container {
             display: flex;
             align-items: center;
             gap: 8px;
-        }}
-        .bar {{
+        }
+        .bar {
             height: 20px;
             background: linear-gradient(90deg, #0073ea, #0060c0);
             border-radius: 4px;
             min-width: 4px;
             transition: width 0.3s ease;
-        }}
-        .top-bar {{
+        }
+        .top-bar {
             background: linear-gradient(90deg, #fdab3d, #e07c00);
-        }}
-        .bar-value {{
+        }
+        .bar-value {
             font-weight: 700;
             font-size: 13px;
-            color: #e0e0e0;
+            color: #ffffff !important;
             min-width: 24px;
-        }}
-        .medal {{
+        }
+        .medal {
             font-size: 10px;
             font-weight: 700;
             padding: 1px 5px;
             border-radius: 3px;
             margin-left: 4px;
             vertical-align: middle;
-        }}
-        .gold {{ background: #4a3f1f; color: #ffd700; }}
-        .silver {{ background: #3a3a4a; color: #c0c0c0; }}
-        .bronze {{ background: #3d2f1f; color: #cd7f32; }}
-        .empty {{
+        }
+        .gold { background: #4a3f1f; color: #ffd700 !important; }
+        .silver { background: #3a3a4a; color: #c0c0c0 !important; }
+        .bronze { background: #3d2f1f; color: #cd7f32 !important; }
+        .empty {
             text-align: center;
-            color: #666;
+            color: #888 !important;
             padding: 32px 16px;
             font-style: italic;
-        }}
-        .updated {{
+        }
+        .updated {
             text-align: center;
-            color: #666;
+            color: #888 !important;
             font-size: 11px;
             padding: 12px;
             margin-top: 16px;
-        }}
+        }
 """
 
 
@@ -1385,16 +1386,12 @@ async def dashboard_inventory():
     if not rows:
         rows = '<tr><td colspan="2" class="empty">No items in stock</td></tr>'
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Inventory — In Stock</title>
-    <style>{DASHBOARD_CSS}</style>
-</head>
-<body>
-    <div class="card">
+    html = ("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Inventory — In Stock</title><style>"
+            + DASHBOARD_CSS
+            + "</style></head><body>"
+            + f"""<div class="card">
         <div class="card-header">
             <h2>Inventory — In Stock</h2>
             <span class="count">{len(in_stock)} items</span>
@@ -1404,8 +1401,7 @@ async def dashboard_inventory():
         </div>
     </div>
     <div class="updated">Last updated: {now_pt}</div>
-</body>
-</html>"""
+</body></html>""")
     return HTMLResponse(html)
 
 
@@ -1446,16 +1442,12 @@ async def dashboard_top_requested():
     if not rows:
         rows = '<tr><td colspan="3" class="empty">No sample orders recorded yet</td></tr>'
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Top 10 Most Requested</title>
-    <style>{DASHBOARD_CSS}</style>
-</head>
-<body>
-    <div class="card">
+    html = ("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Top 10 Most Requested</title><style>"
+            + DASHBOARD_CSS
+            + "</style></head><body>"
+            + f"""<div class="card">
         <div class="card-header">
             <h2>Top 10 Most Requested</h2>
             <span class="count">all time</span>
@@ -1465,8 +1457,7 @@ async def dashboard_top_requested():
         </div>
     </div>
     <div class="updated">Last updated: {now_pt}</div>
-</body>
-</html>"""
+</body></html>""")
     return HTMLResponse(html)
 
 
