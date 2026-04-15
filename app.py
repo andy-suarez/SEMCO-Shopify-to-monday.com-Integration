@@ -14,6 +14,7 @@ from email.mime.multipart import MIMEMultipart
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1163,6 +1164,296 @@ async def health():
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Live sample inventory dashboard — embed in Monday.com via iframe widget."""
+
+    # Query the sample board for all inventory subitems with current values
+    if not MONDAY_SAMPLE_BOARD_ID:
+        return HTMLResponse("<h2>MONDAY_SAMPLE_BOARD_ID not configured</h2>", status_code=500)
+
+    board_id = MONDAY_SAMPLE_BOARD_ID
+    query = """
+    query ($boardId: [ID!]) {
+        boards(ids: $boardId) {
+            items_page(limit: 50) {
+                items {
+                    id name
+                    group { title }
+                    subitems {
+                        id name
+                        column_values { id text }
+                    }
+                }
+            }
+        }
+    }
+    """
+    result = await monday_request(query, {"boardId": [board_id]})
+    if not result or not result.get("data", {}).get("boards"):
+        return HTMLResponse("<h2>Failed to load sample board data</h2>", status_code=500)
+
+    # Also discover column IDs if needed (for matching qty/times columns)
+    await _discover_sample_board()
+    qty_col = _sample_board_cache.get("subitem_qty_col")
+    times_col = _sample_board_cache.get("subitem_times_col")
+
+    # Build flat list of all inventory colors
+    all_items: list[dict] = []
+    for item in result["data"]["boards"][0]["items_page"]["items"]:
+        group_title = item.get("group", {}).get("title", "")
+        if group_title != SAMPLE_INVENTORY_GROUP_NAME:
+            continue
+
+        parent_name = item["name"]
+        for sub in item.get("subitems", []):
+            qty = 0
+            times_ordered = 0
+            for cv in sub.get("column_values", []):
+                if cv["id"] == qty_col and cv.get("text"):
+                    try:
+                        qty = int(float(cv["text"]))
+                    except (ValueError, TypeError):
+                        pass
+                elif times_col and cv["id"] == times_col and cv.get("text"):
+                    try:
+                        times_ordered = int(float(cv["text"]))
+                    except (ValueError, TypeError):
+                        pass
+
+            all_items.append({
+                "label": f"{parent_name} — {sub['name']}",
+                "color": sub["name"],
+                "parent": parent_name,
+                "quantity": qty,
+                "times_ordered": times_ordered,
+            })
+
+    # Filter and sort
+    in_stock = sorted([i for i in all_items if i["quantity"] > 0], key=lambda x: (-x["quantity"], x["label"]))
+    top_requested = sorted([i for i in all_items if i["times_ordered"] > 0], key=lambda x: -x["times_ordered"])[:10]
+
+    now_pt = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y at %I:%M %p PT")
+
+    # Build inventory rows
+    inv_rows = ""
+    for item in in_stock:
+        bar_width = min(item["quantity"] * 8, 100)
+        inv_rows += f"""
+        <tr>
+            <td class="label-cell">{item["label"]}</td>
+            <td class="qty-cell">
+                <div class="bar-container">
+                    <div class="bar" style="width: {bar_width}%"></div>
+                    <span class="bar-value">{item["quantity"]}</span>
+                </div>
+            </td>
+        </tr>"""
+
+    if not inv_rows:
+        inv_rows = '<tr><td colspan="2" class="empty">No items in stock</td></tr>'
+
+    # Build top 10 rows
+    top_rows = ""
+    max_times = top_requested[0]["times_ordered"] if top_requested else 1
+    for i, item in enumerate(top_requested, 1):
+        bar_width = (item["times_ordered"] / max_times) * 100
+        medal = ""
+        if i == 1:
+            medal = ' <span class="medal gold">1st</span>'
+        elif i == 2:
+            medal = ' <span class="medal silver">2nd</span>'
+        elif i == 3:
+            medal = ' <span class="medal bronze">3rd</span>'
+
+        top_rows += f"""
+        <tr>
+            <td class="rank-cell">{i}</td>
+            <td class="label-cell">{item["label"]}{medal}</td>
+            <td class="qty-cell">
+                <div class="bar-container">
+                    <div class="bar top-bar" style="width: {bar_width}%"></div>
+                    <span class="bar-value">{item["times_ordered"]}</span>
+                </div>
+            </td>
+        </tr>"""
+
+    if not top_rows:
+        top_rows = '<tr><td colspan="3" class="empty">No sample orders recorded yet</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sample Inventory Dashboard</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f6f7fb;
+            color: #323338;
+            padding: 24px;
+        }}
+        .dashboard {{
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }}
+        @media (max-width: 900px) {{
+            .dashboard {{ grid-template-columns: 1fr; }}
+        }}
+        .card {{
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }}
+        .card-header {{
+            padding: 16px 20px;
+            border-bottom: 1px solid #e6e9ef;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .card-header h2 {{
+            font-size: 16px;
+            font-weight: 600;
+            color: #323338;
+        }}
+        .card-header .icon {{
+            font-size: 20px;
+        }}
+        .card-header .count {{
+            margin-left: auto;
+            background: #e6e9ef;
+            color: #676879;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }}
+        .card-body {{
+            max-height: 520px;
+            overflow-y: auto;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        tr {{
+            border-bottom: 1px solid #f0f1f3;
+        }}
+        tr:last-child {{
+            border-bottom: none;
+        }}
+        tr:hover {{
+            background: #f6f7fb;
+        }}
+        td {{
+            padding: 10px 16px;
+            font-size: 13px;
+        }}
+        .label-cell {{
+            color: #323338;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 300px;
+        }}
+        .rank-cell {{
+            color: #676879;
+            font-weight: 600;
+            width: 32px;
+            text-align: center;
+        }}
+        .qty-cell {{
+            width: 120px;
+        }}
+        .bar-container {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .bar {{
+            height: 20px;
+            background: linear-gradient(90deg, #0073ea, #0060c0);
+            border-radius: 4px;
+            min-width: 4px;
+            transition: width 0.3s ease;
+        }}
+        .top-bar {{
+            background: linear-gradient(90deg, #fdab3d, #e07c00);
+        }}
+        .bar-value {{
+            font-weight: 700;
+            font-size: 13px;
+            color: #323338;
+            min-width: 24px;
+        }}
+        .medal {{
+            font-size: 10px;
+            font-weight: 700;
+            padding: 1px 5px;
+            border-radius: 3px;
+            margin-left: 4px;
+            vertical-align: middle;
+        }}
+        .gold {{ background: #fff3cd; color: #856404; }}
+        .silver {{ background: #e9ecef; color: #495057; }}
+        .bronze {{ background: #fde2cc; color: #8b4513; }}
+        .empty {{
+            text-align: center;
+            color: #999;
+            padding: 32px 16px;
+            font-style: italic;
+        }}
+        .updated {{
+            text-align: center;
+            color: #999;
+            font-size: 11px;
+            padding: 12px;
+            margin-top: 16px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <div class="card">
+            <div class="card-header">
+                <span class="icon">📦</span>
+                <h2>Inventory — In Stock</h2>
+                <span class="count">{len(in_stock)} items</span>
+            </div>
+            <div class="card-body">
+                <table>
+                    {inv_rows}
+                </table>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <span class="icon">🔥</span>
+                <h2>Top 10 Most Requested</h2>
+                <span class="count">all time</span>
+            </div>
+            <div class="card-body">
+                <table>
+                    {top_rows}
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="updated">Last updated: {now_pt}</div>
+</body>
+</html>"""
+
+    return HTMLResponse(html)
 
 
 @app.post("/webhook/{store_key}")
