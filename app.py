@@ -211,19 +211,32 @@ def get_subitem_col(key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Sample board — group and column discovery
+# Sample board — group and column discovery + inventory tracking
 # ---------------------------------------------------------------------------
 SAMPLE_LOG_GROUP_NAME = "Sample Requests Log"
+SAMPLE_INVENTORY_GROUP_NAME = "Sample Inventory"
+
+# Maps Shopify texture prefix → Monday.com parent item name fragment
+TEXTURE_MAP = {
+    "corsa": "Corsa/Smooth",
+    "vellum": "Vellum/Natural",
+    "polished": "Polished",
+    "solid": "Solid",
+    "grain": "Grain",
+    "ada": "ADA",
+}
 
 _sample_board_cache: dict = {
     "board_id": None,
     "log_group_id": None,         # Group ID for "Sample Requests Log"
-    "subitem_qty_col": None,      # Subitem Quantity1 column ID
+    "subitem_board_id": None,     # Subitem board ID for the sample board
+    "subitem_qty_col": None,      # Subitem Quantity1 column ID (numbers6)
+    "inventory": {},              # {"Corsa/Smooth": {"item_id": "123", "colors": {"rawhide": {...}, ...}}, ...}
 }
 
 
 async def _discover_sample_board() -> None:
-    """Discover group ID and subitem columns for the sample inventory board."""
+    """Discover group ID, subitem columns, and inventory items for the sample board."""
     board_id = MONDAY_SAMPLE_BOARD_ID
     if not board_id:
         return
@@ -233,7 +246,7 @@ async def _discover_sample_board() -> None:
 
     logger.info("Discovering sample board structure for board %s ...", board_id)
 
-    # Discover groups
+    # Discover groups and columns
     group_query = """
     query ($boardId: [ID!]) {
         boards(ids: $boardId) {
@@ -249,7 +262,7 @@ async def _discover_sample_board() -> None:
 
     board_data = result["data"]["boards"][0]
 
-    # Find the Sample Requests Log group
+    # Find groups
     log_group_id = None
     for group in board_data.get("groups", []):
         logger.info("  Found group: '%s' (ID: %s)", group["title"], group["id"])
@@ -260,7 +273,7 @@ async def _discover_sample_board() -> None:
     if not log_group_id:
         logger.error("SAMPLE BOARD DISCOVERY FAILED: Group '%s' not found on board %s", SAMPLE_LOG_GROUP_NAME, board_id)
 
-    # Find subitem board and Quantity1 column
+    # Find subitem board and quantity column
     subitem_qty_col = None
     subitem_board_id = None
     for col in board_data.get("columns", []):
@@ -289,10 +302,146 @@ async def _discover_sample_board() -> None:
                     subitem_qty_col = col["id"]
                     logger.info("  MATCHED sample subitem column 'Quantity1' → ID: %s", subitem_qty_col)
 
+    # Discover inventory items and their color subitems
+    inventory: dict = {}
+    items_query = """
+    query ($boardId: [ID!]) {
+        boards(ids: $boardId) {
+            items_page(limit: 50) {
+                items {
+                    id name
+                    group { title }
+                    subitems {
+                        id name
+                        column_values { id text }
+                    }
+                }
+            }
+        }
+    }
+    """
+    items_result = await monday_request(items_query, {"boardId": [board_id]})
+    if items_result and items_result.get("data", {}).get("boards"):
+        for item in items_result["data"]["boards"][0]["items_page"]["items"]:
+            group_title = item.get("group", {}).get("title", "")
+            if group_title != SAMPLE_INVENTORY_GROUP_NAME:
+                continue
+
+            # Extract texture from item name (e.g., "Flex Samples - X-BOND Corsa/Smooth" → "Corsa/Smooth")
+            item_name = item["name"]
+            for texture_key, texture_label in TEXTURE_MAP.items():
+                if texture_label.lower() in item_name.lower():
+                    colors: dict = {}
+                    for sub in item.get("subitems", []):
+                        # Get current quantity from column values
+                        current_qty = 0
+                        for cv in sub.get("column_values", []):
+                            if cv.get("text"):
+                                try:
+                                    current_qty = int(float(cv["text"]))
+                                except (ValueError, TypeError):
+                                    pass
+                        colors[sub["name"].strip().lower()] = {
+                            "id": sub["id"],
+                            "name": sub["name"],
+                            "quantity": current_qty,
+                        }
+                    inventory[texture_label] = {
+                        "item_id": item["id"],
+                        "item_name": item_name,
+                        "colors": colors,
+                    }
+                    logger.info("  INVENTORY: '%s' (ID: %s) — %d colors", item_name, item["id"], len(colors))
+                    break
+
     _sample_board_cache["board_id"] = board_id
     _sample_board_cache["log_group_id"] = log_group_id
+    _sample_board_cache["subitem_board_id"] = subitem_board_id
     _sample_board_cache["subitem_qty_col"] = subitem_qty_col
-    logger.info("Sample board discovery complete: log_group=%s, qty_col=%s", log_group_id, subitem_qty_col)
+    _sample_board_cache["inventory"] = inventory
+    logger.info("Sample board discovery complete: log_group=%s, subitem_board=%s, qty_col=%s, inventory_items=%d",
+                log_group_id, subitem_board_id, subitem_qty_col, len(inventory))
+
+
+async def _decrement_sample_inventory(color: str, texture: str, quantity: int, order_name: str) -> None:
+    """Decrement the inventory count for a specific color+texture on the sample board.
+
+    Args:
+        color: Color name (e.g., "Rawhide", "Polar Bear")
+        texture: Texture label matching TEXTURE_MAP values (e.g., "Corsa/Smooth", "Vellum/Natural")
+        quantity: Amount to subtract
+        order_name: For logging
+    """
+    inventory = _sample_board_cache.get("inventory", {})
+    qty_col = _sample_board_cache.get("subitem_qty_col")
+
+    if not inventory or not qty_col:
+        logger.warning("INVENTORY DECREMENT SKIPPED for %s/%s — inventory not loaded", texture, color)
+        return
+
+    texture_data = inventory.get(texture)
+    if not texture_data:
+        logger.warning("INVENTORY DECREMENT SKIPPED: Texture '%s' not found on sample board (order %s)", texture, order_name)
+        return
+
+    color_key = color.strip().lower()
+    color_data = texture_data["colors"].get(color_key)
+    if not color_data:
+        logger.warning("INVENTORY DECREMENT SKIPPED: Color '%s' not found under '%s' (order %s)", color, texture, order_name)
+        return
+
+    # Read current value from Monday.com (fresh read to avoid stale cache)
+    read_query = """
+    query ($itemId: [ID!]) {
+        items(ids: $itemId) {
+            column_values { id text }
+        }
+    }
+    """
+    read_result = await monday_request(read_query, {"itemId": [color_data["id"]]})
+    current_qty = color_data["quantity"]  # Fallback to cached value
+    if read_result and read_result.get("data", {}).get("items"):
+        for cv in read_result["data"]["items"][0].get("column_values", []):
+            if cv["id"] == qty_col and cv.get("text"):
+                try:
+                    current_qty = int(float(cv["text"]))
+                except (ValueError, TypeError):
+                    pass
+
+    new_qty = max(0, current_qty - quantity)
+
+    # Update the subitem quantity
+    subitem_board_id = _sample_board_cache.get("subitem_board_id")
+    if not subitem_board_id:
+        logger.error("INVENTORY DECREMENT FAILED: Could not find subitem board ID")
+        return
+
+    update_query = """
+    mutation ($boardId: ID!, $itemId: ID!, $columnId: String!, $value: JSON!) {
+        change_column_value(
+            board_id: $boardId,
+            item_id: $itemId,
+            column_id: $columnId,
+            value: $value
+        ) {
+            id
+        }
+    }
+    """
+    result = await monday_request(update_query, {
+        "boardId": subitem_board_id,
+        "itemId": color_data["id"],
+        "columnId": qty_col,
+        "value": json.dumps(str(new_qty)),
+    })
+
+    if result:
+        logger.info("INVENTORY DECREMENTED: %s / %s: %d → %d (-%d) for order %s",
+                     texture, color_data["name"], current_qty, new_qty, quantity, order_name)
+        # Update cache
+        color_data["quantity"] = new_qty
+    else:
+        logger.error("INVENTORY DECREMENT FAILED: %s / %s for order %s", texture, color, order_name)
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +729,29 @@ async def log_sample_order(order: dict, store_key: str) -> None:
         if not any(sample in title.lower() for sample in SAMPLE_PRODUCT_NAMES):
             continue
 
+        variant_title = (li.get("variant_title") or "").strip()
+
+        # Parse texture and color based on store
+        # Pro format: variant_title = "Corsa / Polar Bear" → texture=Corsa/Smooth, color=Polar Bear
+        # Spaces format: variant_title = "Phantom" → texture=Corsa/Smooth (always), color=Phantom
+        if store_key == "semco_pro" and " / " in variant_title:
+            parts_split = variant_title.split(" / ", 1)
+            texture_prefix = parts_split[0].strip().lower()
+            color_name = parts_split[1].strip()
+            # Map Shopify texture prefix to Monday.com texture label
+            texture_label = None
+            for key, label in TEXTURE_MAP.items():
+                if key in texture_prefix:
+                    texture_label = label
+                    break
+            if not texture_label:
+                logger.warning("Unknown texture prefix '%s' from Pro sample — defaulting to Corsa/Smooth", texture_prefix)
+                texture_label = "Corsa/Smooth"
+        else:
+            # Spaces: always Corsa/Smooth, variant_title is the color
+            texture_label = "Corsa/Smooth"
+            color_name = variant_title
+
         # Use the same color expansion logic as regular orders (handles both Pro and Spaces formats)
         expanded = _expand_line_item_colors(li)
         for item in expanded:
@@ -591,6 +763,11 @@ async def log_sample_order(order: dict, store_key: str) -> None:
                 sub_columns[subitem_qty_col] = str(item["quantity"])
 
             await create_subitem(parent_id, subitem_name, sub_columns)
+
+            # Decrement inventory — use parsed color or expanded color
+            decrement_color = item["color"] if item["color"] else color_name
+            if decrement_color:
+                await _decrement_sample_inventory(decrement_color, texture_label, item["quantity"], order_name)
 
     logger.info("SAMPLE LOG: Order %s logged to Sample Requests Log on board %s", order_name, MONDAY_SAMPLE_BOARD_ID)
 
