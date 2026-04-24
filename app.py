@@ -1428,79 +1428,167 @@ async def _set_shopify_inventory(
         "inventory_item_id": int(inventory_item_id),
         "available": int(quantity),
     }
+    logger.info(
+        "  → Shopify POST /inventory_levels/set.json store=%s body=%s",
+        store_key, body,
+    )
     resp = await shopify_request(store_key, "POST", "/inventory_levels/set.json", body)
-    return resp is not None
+    if resp is None:
+        logger.error(
+            "  ← Shopify POST /inventory_levels/set.json FAILED store=%s inventory_item_id=%s available=%s",
+            store_key, inventory_item_id, quantity,
+        )
+        return False
+    # Successful response includes updated inventory_level object
+    level = resp.get("inventory_level") if isinstance(resp, dict) else None
+    if level:
+        logger.info(
+            "  ← Shopify OK store=%s inventory_item_id=%s available=%s updated_at=%s",
+            store_key, level.get("inventory_item_id"),
+            level.get("available"), level.get("updated_at"),
+        )
+    else:
+        logger.info("  ← Shopify OK store=%s (empty response body)", store_key)
+    return True
 
 
 async def _run_inventory_sync(dry_run: bool = False) -> dict:
     """Orchestrator: read Monday sample inventory once, push to each configured Shopify store."""
-    logger.info("=" * 60)
-    logger.info("INVENTORY SYNC START (dry_run=%s)", dry_run)
-    logger.info("=" * 60)
+    run_started = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S PT")
+    logger.info("=" * 70)
+    if dry_run:
+        logger.info("INVENTORY SYNC START — DRY RUN (no writes to Shopify) — %s", run_started)
+    else:
+        logger.info("INVENTORY SYNC START — LIVE RUN (will write to Shopify) — %s", run_started)
+    logger.info("=" * 70)
 
+    # Config visibility — surface what this run is about to do before any I/O
+    configured_stores = [k for k in SHOPIFY_SYNC_STORES if _sync_store_is_configured(k)]
+    unconfigured_stores = [k for k in SHOPIFY_SYNC_STORES if not _sync_store_is_configured(k)]
+    logger.info("CONFIG: monday_sample_board_id=%s", MONDAY_SAMPLE_BOARD_ID or "(not set)")
+    logger.info("CONFIG: shopify_api_version=%s", SHOPIFY_API_VERSION)
+    logger.info("CONFIG: configured_stores=%s", configured_stores or "(none)")
+    if unconfigured_stores:
+        logger.info("CONFIG: unconfigured_stores (skipped)=%s", unconfigured_stores)
+    for key in configured_stores:
+        cfg = SHOPIFY_SYNC_STORES[key]
+        # Only log non-secret config fields
+        logger.info(
+            "CONFIG store=%s domain=%s location_id=%s product_id=%s client_id_prefix=%s",
+            key, cfg.get("domain"), cfg.get("location_id"), cfg.get("product_id"),
+            (cfg.get("client_id") or "")[:8] + "..." if cfg.get("client_id") else "(missing)",
+        )
+
+    if not configured_stores:
+        logger.error("INVENTORY SYNC ABORTED: no stores configured")
+        return {"monday_rows": 0, "stores": {}, "error": "no_stores_configured"}
+
+    logger.info("-" * 70)
+    logger.info("STEP 1: Reading Monday sample inventory ...")
     monday_items = await _fetch_sample_inventory_data()
     if monday_items is None:
-        logger.error("Inventory sync ABORTED: could not read Monday sample board")
+        logger.error("INVENTORY SYNC ABORTED: could not read Monday sample board")
         return {"monday_rows": 0, "stores": {}, "error": "monday_read_failed"}
 
     monday_lookup = _monday_inventory_to_lookup(monday_items)
     summary: dict = {"monday_rows": len(monday_lookup), "stores": {}}
+    logger.info(
+        "STEP 1 DONE: %d Monday rows loaded → %d unique (texture, color) keys",
+        len(monday_items), len(monday_lookup),
+    )
+    # Preview first 10 monday keys + quantities so we can eyeball the data shape
+    preview = list(monday_lookup.items())[:10]
+    logger.info("MONDAY PREVIEW (first %d of %d):", len(preview), len(monday_lookup))
+    for (texture, color), qty in preview:
+        logger.info("  monday: (%s, %s) = %s", texture, color, qty)
 
     if not monday_lookup:
-        logger.warning("Monday inventory empty — aborting sync")
+        logger.warning("Monday inventory empty — nothing to sync")
         return summary
 
-    for store_key in SHOPIFY_SYNC_STORES:
-        if not _sync_store_is_configured(store_key):
-            logger.info("Store '%s' not configured — skipping", store_key)
-            continue
-
+    for store_idx, store_key in enumerate(configured_stores, 1):
+        logger.info("-" * 70)
+        logger.info("STEP 2.%d: Processing store '%s' ...", store_idx, store_key)
         store_summary = {"matched": 0, "skipped_missing": 0, "updated": 0, "errors": 0}
         summary["stores"][store_key] = store_summary
 
+        # Show a sample of the Shopify variant map so we can verify join-key alignment
         variant_map = await _discover_shopify_variants(store_key)
         if not variant_map:
             logger.error("No variants discovered for store '%s' — skipping", store_key)
             continue
+        variant_preview = list(variant_map.items())[:10]
+        logger.info(
+            "  Shopify store='%s' has %d variants. Preview (first %d):",
+            store_key, len(variant_map), len(variant_preview),
+        )
+        for (texture, color), iid in variant_preview:
+            logger.info("  shopify: (%s, %s) → inventory_item_id=%s", texture, color, iid)
 
+        # Compute match stats before any writes
+        matched_keys = [k for k in monday_lookup if k in variant_map]
+        missing_keys = [k for k in monday_lookup if k not in variant_map]
+        shopify_only_keys = [k for k in variant_map if k not in monday_lookup]
+        logger.info(
+            "  JOIN STATS store='%s': matched=%d, monday_only=%d (will be skipped), shopify_only=%d (will be left alone)",
+            store_key, len(matched_keys), len(missing_keys), len(shopify_only_keys),
+        )
+        if missing_keys:
+            logger.warning("  Monday rows with no Shopify variant (first 10): %s", missing_keys[:10])
+
+        logger.info(
+            "  STEP 2.%d EXECUTING: %d writes %s",
+            store_idx, len(matched_keys),
+            "(DRY RUN — nothing will actually be sent)" if dry_run else "(LIVE — quantities WILL be set in Shopify)",
+        )
+
+        processed = 0
         for (texture, color), qty in monday_lookup.items():
             inventory_item_id = variant_map.get((texture, color))
             if inventory_item_id is None:
                 logger.warning(
-                    "Missing mapping in store '%s': (%s, %s) — skipping",
-                    store_key, texture, color,
+                    "  SKIP missing mapping store='%s' (%s, %s) qty=%s",
+                    store_key, texture, color, qty,
                 )
                 store_summary["skipped_missing"] += 1
                 continue
 
             store_summary["matched"] += 1
+            processed += 1
 
             if dry_run:
                 logger.info(
-                    "[DRY RUN] store=%s would set (%s, %s) → %d (inventory_item_id=%s)",
+                    "  [DRY RUN %d/%d] store=%s would set (%s, %s) → %d (inventory_item_id=%s)",
+                    processed, len(matched_keys),
                     store_key, texture, color, qty, inventory_item_id,
                 )
                 store_summary["updated"] += 1
                 continue
 
+            logger.info(
+                "  [LIVE %d/%d] store=%s setting (%s, %s) → %d (inventory_item_id=%s)",
+                processed, len(matched_keys),
+                store_key, texture, color, qty, inventory_item_id,
+            )
             ok = await _set_shopify_inventory(store_key, inventory_item_id, qty)
             if ok:
                 store_summary["updated"] += 1
-                logger.info(
-                    "SET store=%s (%s, %s) → %d",
-                    store_key, texture, color, qty,
-                )
             else:
                 store_summary["errors"] += 1
-                logger.error(
-                    "FAILED to set store=%s (%s, %s) → %d",
-                    store_key, texture, color, qty,
-                )
             await asyncio.sleep(0.5)  # stay under Shopify 2 req/s soft limit
 
-    logger.info("=" * 60)
-    logger.info("INVENTORY SYNC COMPLETE: %s", summary)
-    logger.info("=" * 60)
+        logger.info(
+            "  STEP 2.%d DONE store='%s': matched=%d updated=%d errors=%d skipped_missing=%d",
+            store_idx, store_key,
+            store_summary["matched"], store_summary["updated"],
+            store_summary["errors"], store_summary["skipped_missing"],
+        )
+
+    run_finished = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S PT")
+    logger.info("=" * 70)
+    logger.info("INVENTORY SYNC COMPLETE — %s (started %s)", run_finished, run_started)
+    logger.info("SUMMARY: %s", summary)
+    logger.info("=" * 70)
     return summary
 
 
@@ -1857,13 +1945,29 @@ async def _safe_process_order(order: dict, store_key: str, order_name: str) -> N
 @app.post("/sync-inventory")
 async def sync_inventory(request: Request):
     """Trigger Monday → Shopify sample inventory sync. Protected by SYNC_AUTH_TOKEN."""
+    # Request-level logging before auth, for traceability
+    client_ip = (request.client.host if request.client else "unknown")
+    user_agent = request.headers.get("user-agent", "(no user-agent)")
     token = request.headers.get("X-Sync-Token", "")
-    if not SYNC_AUTH_TOKEN or not hmac.compare_digest(token, SYNC_AUTH_TOKEN):
-        logger.warning("/sync-inventory REJECTED: invalid or missing X-Sync-Token")
-        return Response(status_code=401, content="Unauthorized")
-
     dry_run_raw = request.query_params.get("dry_run", "")
     dry_run = dry_run_raw.lower() in ("true", "1", "yes")
+
+    logger.info(
+        "/sync-inventory called from ip=%s ua='%s' dry_run=%s token_present=%s",
+        client_ip, user_agent, dry_run, bool(token),
+    )
+
+    if not SYNC_AUTH_TOKEN:
+        logger.error(
+            "/sync-inventory REJECTED: SYNC_AUTH_TOKEN not configured on server (ip=%s)",
+            client_ip,
+        )
+        return Response(status_code=401, content="Unauthorized")
+    if not hmac.compare_digest(token, SYNC_AUTH_TOKEN):
+        logger.warning("/sync-inventory REJECTED: invalid X-Sync-Token (ip=%s)", client_ip)
+        return Response(status_code=401, content="Unauthorized")
+
+    logger.info("/sync-inventory AUTH OK — starting sync (dry_run=%s)", dry_run)
 
     try:
         summary = await _run_inventory_sync(dry_run=dry_run)
@@ -1871,6 +1975,10 @@ async def sync_inventory(request: Request):
         logger.exception("UNHANDLED ERROR during inventory sync")
         return {"status": "error", "dry_run": dry_run, "message": "See server logs"}
 
+    logger.info(
+        "/sync-inventory responding 200: dry_run=%s summary=%s",
+        dry_run, summary,
+    )
     return {"status": "ok", "dry_run": dry_run, "summary": summary}
 
 
