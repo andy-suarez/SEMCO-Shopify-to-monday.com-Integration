@@ -253,9 +253,82 @@ curl http://localhost:8000/health
 python get_column_ids.py <MONDAY_API_KEY> <BOARD_ID>
 ```
 
+## Sample Inventory Sync (Monday → Shopify)
+
+A one-way polling sync pushes sample stock quantities from the Monday.com **Sample Inventory board** to the Shopify sample product on each configured store. Triggered by a **Render Cron Job** that POSTs to `/sync-inventory` once daily.
+
+### What it does
+- Reads the Monday sample board via the existing `_fetch_sample_inventory_data()` helper (single source of truth — same data the dashboards use)
+- For each Shopify store in `SHOPIFY_SYNC_STORES`:
+  - Fetches all variants of the configured sample product
+  - Joins Monday rows to Shopify variants by `(texture, color)` (case-insensitive)
+  - Sets `inventory_level.available` at the configured location to the Monday quantity
+- Monday rows without a Shopify match → logged as `Missing mapping` and skipped (no failure)
+- Shopify variants without a Monday match → left alone (no zero-out)
+
+### Texture/color join keys
+- Monday side: parent name `"Flex Samples - Corsa/Smooth"` → `texture = "Corsa/Smooth"`; subitem name → `color`. Both lowercased + stripped.
+- Shopify side: variant title `"Corsa/Smooth / Baked Clay"` → split on ` / ` → `(texture, color)`. Both lowercased + stripped.
+- Special case: `"Custom Flex Samples"` → texture becomes `"Custom"` (matches dashboard behavior).
+
+### Shopify auth (2026 Dev Dashboard flow)
+- Per-store OAuth `client_credentials` grant against `POST /admin/oauth/access_token`
+- Each store install has its own `client_id` + `client_secret` (they are NOT shared across stores)
+- Access token cached in memory for 24h; re-minted on 401 or expiry
+- `X-Shopify-Access-Token` header on all REST calls
+- Uses Shopify Admin REST API version `2024-10`
+- 429 responses honor `Retry-After` and retry once
+
+### Environment Variables (sync-specific)
+
+| Variable | Description |
+|----------|-------------|
+| `SHOPIFY_PRO_STORE_DOMAIN` | e.g. `semcopro.myshopify.com` |
+| `SHOPIFY_PRO_CLIENT_ID` | OAuth client ID from Dev Dashboard → Settings (Pro install) |
+| `SHOPIFY_PRO_CLIENT_SECRET` | OAuth client secret (Pro install) |
+| `SHOPIFY_PRO_LOCATION_ID` | Shopify location ID where sample stock lives |
+| `SHOPIFY_PRO_SAMPLE_PRODUCT_ID` | Sample product ID on the Pro store |
+| `SYNC_AUTH_TOKEN` | Shared secret header for `/sync-inventory` (random 32+ chars) |
+
+`MONDAY_SAMPLE_BOARD_ID` is reused from the existing sample inventory config.
+
+Stores without complete config are silently skipped — enables staged rollout (Pro now, Spaces later).
+
+### Endpoint
+```
+POST /sync-inventory[?dry_run=true|1|yes]
+Header: X-Sync-Token: <SYNC_AUTH_TOKEN>
+```
+Returns `{"status": "ok", "dry_run": bool, "summary": {...}}`. `dry_run=true` logs what would be set but writes nothing to Shopify.
+
+Per-store summary counts: `matched`, `skipped_missing`, `updated`, `errors`.
+
+### Render Cron Schedule
+- Summer (PDT): `0 13 * * *` UTC → 6 AM PT
+- Winter (PST): `0 14 * * *` UTC → 6 AM PT
+- Command:
+  ```bash
+  curl -fsS -X POST \
+    -H "X-Sync-Token: $SYNC_AUTH_TOKEN" \
+    "https://<render-url>/sync-inventory"
+  ```
+
+### Adding SEMCO Spaces later
+1. Install the Dev Dashboard app on `semcospaces.myshopify.com` → copy its (distinct) Client ID + Secret from Settings
+2. Add Spaces env vars (`SHOPIFY_SPACES_*`) in Render
+3. Uncomment the `semco_spaces` block in `SHOPIFY_SYNC_STORES` in `app.py`
+4. Redeploy — sync will pick up Spaces automatically
+
+### Isolation from order processing
+- Uses its own config dict (`SHOPIFY_SYNC_STORES`) — separate from webhook `STORES`
+- Uses its own token and variant caches (`_shopify_token_cache`, `_shopify_variant_cache`)
+- Reuses existing `_fetch_sample_inventory_data()` and `_sample_board_cache` for Monday reads (single source of truth — no double-polling the board)
+- The existing order webhook path, `process_order()`, and sample decrement logic are untouched
+
 ## Out of Scope
 - No database or persistent storage — all state lives in Monday.com
 - No retry queue (Shopify retries webhooks natively)
 - No order update/cancel handling — only `orders/create`
 - No UI — headless service
 - Unlisted columns on the orders board are left empty for manual team input
+- Inventory sync is one-way only (Monday → Shopify); Shopify-originated inventory changes are not read back

@@ -67,6 +67,42 @@ NOTIFY_EMAILS = [e.strip() for e in os.environ.get("NOTIFY_EMAILS", "").split(",
 
 MONDAY_API_URL = "https://api.monday.com/v2"
 
+# ---------------------------------------------------------------------------
+# Sample Inventory Sync — Monday → Shopify (one-way, polling via Render Cron)
+# Isolated from the webhook-receive path above.
+# ---------------------------------------------------------------------------
+SHOPIFY_SYNC_STORES = {
+    "semco_pro": {
+        "domain": os.environ.get("SHOPIFY_PRO_STORE_DOMAIN", ""),
+        "client_id": os.environ.get("SHOPIFY_PRO_CLIENT_ID", ""),
+        "client_secret": os.environ.get("SHOPIFY_PRO_CLIENT_SECRET", ""),
+        "location_id": os.environ.get("SHOPIFY_PRO_LOCATION_ID", ""),
+        "product_id": os.environ.get("SHOPIFY_PRO_SAMPLE_PRODUCT_ID", ""),
+    },
+    # Spaces added later as a config-only change:
+    # "semco_spaces": {
+    #     "domain": os.environ.get("SHOPIFY_SPACES_STORE_DOMAIN", ""),
+    #     "client_id": os.environ.get("SHOPIFY_SPACES_CLIENT_ID", ""),
+    #     "client_secret": os.environ.get("SHOPIFY_SPACES_CLIENT_SECRET", ""),
+    #     "location_id": os.environ.get("SHOPIFY_SPACES_LOCATION_ID", ""),
+    #     "product_id": os.environ.get("SHOPIFY_SPACES_SAMPLE_PRODUCT_ID", ""),
+    # },
+}
+
+SYNC_AUTH_TOKEN = os.environ.get("SYNC_AUTH_TOKEN", "")
+SHOPIFY_API_VERSION = "2024-10"
+
+
+def _sync_store_is_configured(key: str) -> bool:
+    s = SHOPIFY_SYNC_STORES.get(key, {})
+    return all([
+        s.get("domain"),
+        s.get("client_id"),
+        s.get("client_secret"),
+        s.get("location_id"),
+        s.get("product_id"),
+    ])
+
 # Column names to match on the board (auto-discovered by display name)
 PARENT_COL_NAMES = {
     "time_of_order": "Order Input Time",
@@ -1155,6 +1191,320 @@ async def process_order(order: dict, store_key: str) -> None:
             await create_update(parent_id, update_text)
 
 # ---------------------------------------------------------------------------
+# Sample Inventory Sync — implementation
+# Reuses existing _fetch_sample_inventory_data() as the Monday source of truth.
+# All state below is isolated from the order-processing path.
+# ---------------------------------------------------------------------------
+
+# Shopify OAuth token cache: {store_key: {"token": str, "expires_at": float}}
+_shopify_token_cache: dict = {}
+
+# Shopify variant cache: {store_key: {"map": {(texture_lc, color_lc): inventory_item_id},
+#                                      "refreshed_at": float}}
+_shopify_variant_cache: dict = {}
+SHOPIFY_VARIANT_CACHE_TTL = 24 * 3600  # 24 hours
+
+
+async def _shopify_mint_token(store_key: str) -> str | None:
+    """Mint (or return cached) Shopify Admin API access token via client_credentials grant."""
+    cached = _shopify_token_cache.get(store_key)
+    if cached and cached["expires_at"] > time.time() + 60:
+        return cached["token"]
+
+    cfg = SHOPIFY_SYNC_STORES.get(store_key)
+    if not cfg:
+        logger.error("Shopify token mint: unknown store_key '%s'", store_key)
+        return None
+
+    url = f"https://{cfg['domain']}/admin/oauth/access_token"
+    payload = {
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "grant_type": "client_credentials",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload)
+    except httpx.TimeoutException:
+        logger.error("Shopify token mint TIMED OUT for store '%s'", store_key)
+        return None
+    except httpx.HTTPError as e:
+        logger.error("Shopify token mint HTTP error for store '%s': %s", store_key, e)
+        return None
+
+    if resp.status_code != 200:
+        logger.error(
+            "Shopify token mint FAILED for store '%s': status=%d body=%s",
+            store_key, resp.status_code, resp.text[:300],
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error("Shopify token mint: could not parse JSON for '%s': %s", store_key, e)
+        return None
+
+    token = data.get("access_token")
+    expires_in = data.get("expires_in", 86399)
+    scope = data.get("scope", "")
+    if not token:
+        logger.error("Shopify token mint: no access_token in response for '%s': %s", store_key, data)
+        return None
+
+    _shopify_token_cache[store_key] = {
+        "token": token,
+        "expires_at": time.time() + int(expires_in),
+    }
+    logger.info(
+        "Shopify token minted for '%s' (scope=%s, expires_in=%ss)",
+        store_key, scope, expires_in,
+    )
+    return token
+
+
+async def shopify_request(
+    store_key: str,
+    method: str,
+    path: str,
+    json_body: dict | None = None,
+) -> dict | None:
+    """Async Shopify Admin REST API call with token re-mint on 401 and retry on 429."""
+    cfg = SHOPIFY_SYNC_STORES.get(store_key)
+    if not cfg:
+        logger.error("shopify_request: unknown store_key '%s'", store_key)
+        return None
+
+    base = f"https://{cfg['domain']}/admin/api/{SHOPIFY_API_VERSION}"
+    url = f"{base}{path}"
+
+    for attempt in range(2):  # up to 1 retry after 401 re-mint
+        token = await _shopify_mint_token(store_key)
+        if not token:
+            return None
+
+        headers = {
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.request(method, url, headers=headers, json=json_body)
+        except httpx.TimeoutException:
+            logger.error("Shopify %s %s TIMED OUT (store=%s)", method, path, store_key)
+            return None
+        except httpx.HTTPError as e:
+            logger.error("Shopify %s %s HTTP error (store=%s): %s", method, path, store_key, e)
+            return None
+
+        # 401 → invalidate token, retry once
+        if resp.status_code == 401 and attempt == 0:
+            logger.warning(
+                "Shopify 401 for %s %s (store=%s) — invalidating token and re-minting",
+                method, path, store_key,
+            )
+            _shopify_token_cache.pop(store_key, None)
+            continue
+
+        # 429 → respect Retry-After then retry (within same attempt budget)
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After", "2")
+            try:
+                wait_s = float(retry_after)
+            except ValueError:
+                wait_s = 2.0
+            logger.warning(
+                "Shopify 429 for %s %s (store=%s) — sleeping %.1fs then retrying",
+                method, path, store_key, wait_s,
+            )
+            await asyncio.sleep(wait_s)
+            continue
+
+        if resp.status_code >= 400:
+            logger.error(
+                "Shopify %s %s FAILED (store=%s): status=%d body=%s",
+                method, path, store_key, resp.status_code, resp.text[:300],
+            )
+            return None
+
+        if not resp.content:
+            return {}
+
+        try:
+            return resp.json()
+        except Exception as e:
+            logger.error(
+                "Shopify %s %s: JSON decode error (store=%s): %s",
+                method, path, store_key, e,
+            )
+            return None
+
+    logger.error("Shopify %s %s: exhausted retries (store=%s)", method, path, store_key)
+    return None
+
+
+async def _discover_shopify_variants(store_key: str) -> dict:
+    """Return {(texture_lc, color_lc): inventory_item_id} for the store's sample product.
+
+    Variant titles are shaped "Corsa/Smooth / Baked Clay" — split on " / ".
+    """
+    cached = _shopify_variant_cache.get(store_key)
+    if cached and (time.time() - cached["refreshed_at"]) < SHOPIFY_VARIANT_CACHE_TTL:
+        return cached["map"]
+
+    cfg = SHOPIFY_SYNC_STORES[store_key]
+    path = f"/products/{cfg['product_id']}/variants.json?limit=250"
+    resp = await shopify_request(store_key, "GET", path)
+    if not resp:
+        logger.error("Variant discovery FAILED for store '%s'", store_key)
+        return {}
+
+    variants = resp.get("variants", []) or []
+    variant_map: dict = {}
+    skipped = 0
+    for v in variants:
+        title = (v.get("title") or "").strip()
+        inventory_item_id = v.get("inventory_item_id")
+        if not title or inventory_item_id is None:
+            skipped += 1
+            continue
+        if " / " not in title:
+            logger.warning(
+                "Variant skipped (no ' / ' separator) store=%s id=%s title='%s'",
+                store_key, v.get("id"), title,
+            )
+            skipped += 1
+            continue
+        texture_raw, color_raw = title.split(" / ", 1)
+        key = (texture_raw.strip().lower(), color_raw.strip().lower())
+        if key in variant_map:
+            logger.warning(
+                "Duplicate (texture, color) variant in store=%s: %s — last wins (id=%s)",
+                store_key, key, v.get("id"),
+            )
+        variant_map[key] = int(inventory_item_id)
+
+    _shopify_variant_cache[store_key] = {
+        "map": variant_map,
+        "refreshed_at": time.time(),
+    }
+    logger.info(
+        "Discovered %d Shopify variants for store '%s' (skipped=%d)",
+        len(variant_map), store_key, skipped,
+    )
+    return variant_map
+
+
+def _monday_inventory_to_lookup(items: list[dict]) -> dict:
+    """Convert the flat list from _fetch_sample_inventory_data() into {(texture_lc, color_lc): qty}.
+
+    `parent` is like "Flex Samples - Corsa/Smooth"; strip "Flex Samples - " to align with
+    Shopify variant texture. `Custom Flex Samples` becomes "Custom" (matches dashboard behavior).
+    """
+    lookup: dict = {}
+    for item in items:
+        parent = (item.get("parent") or "").strip()
+        if parent.startswith("Flex Samples - "):
+            texture = parent[len("Flex Samples - "):]
+        elif parent == "Custom Flex Samples":
+            texture = "Custom"
+        else:
+            texture = parent
+        color = (item.get("color") or "").strip()
+        if not texture or not color:
+            continue
+        key = (texture.strip().lower(), color.strip().lower())
+        lookup[key] = int(item.get("quantity") or 0)
+    return lookup
+
+
+async def _set_shopify_inventory(
+    store_key: str, inventory_item_id: int, quantity: int
+) -> bool:
+    cfg = SHOPIFY_SYNC_STORES[store_key]
+    body = {
+        "location_id": int(cfg["location_id"]),
+        "inventory_item_id": int(inventory_item_id),
+        "available": int(quantity),
+    }
+    resp = await shopify_request(store_key, "POST", "/inventory_levels/set.json", body)
+    return resp is not None
+
+
+async def _run_inventory_sync(dry_run: bool = False) -> dict:
+    """Orchestrator: read Monday sample inventory once, push to each configured Shopify store."""
+    logger.info("=" * 60)
+    logger.info("INVENTORY SYNC START (dry_run=%s)", dry_run)
+    logger.info("=" * 60)
+
+    monday_items = await _fetch_sample_inventory_data()
+    if monday_items is None:
+        logger.error("Inventory sync ABORTED: could not read Monday sample board")
+        return {"monday_rows": 0, "stores": {}, "error": "monday_read_failed"}
+
+    monday_lookup = _monday_inventory_to_lookup(monday_items)
+    summary: dict = {"monday_rows": len(monday_lookup), "stores": {}}
+
+    if not monday_lookup:
+        logger.warning("Monday inventory empty — aborting sync")
+        return summary
+
+    for store_key in SHOPIFY_SYNC_STORES:
+        if not _sync_store_is_configured(store_key):
+            logger.info("Store '%s' not configured — skipping", store_key)
+            continue
+
+        store_summary = {"matched": 0, "skipped_missing": 0, "updated": 0, "errors": 0}
+        summary["stores"][store_key] = store_summary
+
+        variant_map = await _discover_shopify_variants(store_key)
+        if not variant_map:
+            logger.error("No variants discovered for store '%s' — skipping", store_key)
+            continue
+
+        for (texture, color), qty in monday_lookup.items():
+            inventory_item_id = variant_map.get((texture, color))
+            if inventory_item_id is None:
+                logger.warning(
+                    "Missing mapping in store '%s': (%s, %s) — skipping",
+                    store_key, texture, color,
+                )
+                store_summary["skipped_missing"] += 1
+                continue
+
+            store_summary["matched"] += 1
+
+            if dry_run:
+                logger.info(
+                    "[DRY RUN] store=%s would set (%s, %s) → %d (inventory_item_id=%s)",
+                    store_key, texture, color, qty, inventory_item_id,
+                )
+                store_summary["updated"] += 1
+                continue
+
+            ok = await _set_shopify_inventory(store_key, inventory_item_id, qty)
+            if ok:
+                store_summary["updated"] += 1
+                logger.info(
+                    "SET store=%s (%s, %s) → %d",
+                    store_key, texture, color, qty,
+                )
+            else:
+                store_summary["errors"] += 1
+                logger.error(
+                    "FAILED to set store=%s (%s, %s) → %d",
+                    store_key, texture, color, qty,
+                )
+            await asyncio.sleep(0.5)  # stay under Shopify 2 req/s soft limit
+
+    logger.info("=" * 60)
+    logger.info("INVENTORY SYNC COMPLETE: %s", summary)
+    logger.info("=" * 60)
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -1502,6 +1852,26 @@ async def _safe_process_order(order: dict, store_key: str, order_name: str) -> N
     except Exception as e:
         logger.exception("UNHANDLED ERROR processing order %s from %s", order_name, store_key)
         send_failure_email(store_key, order_name, f"Unhandled exception: {type(e).__name__}: {e}", context="Order processing crashed unexpectedly")
+
+
+@app.post("/sync-inventory")
+async def sync_inventory(request: Request):
+    """Trigger Monday → Shopify sample inventory sync. Protected by SYNC_AUTH_TOKEN."""
+    token = request.headers.get("X-Sync-Token", "")
+    if not SYNC_AUTH_TOKEN or not hmac.compare_digest(token, SYNC_AUTH_TOKEN):
+        logger.warning("/sync-inventory REJECTED: invalid or missing X-Sync-Token")
+        return Response(status_code=401, content="Unauthorized")
+
+    dry_run_raw = request.query_params.get("dry_run", "")
+    dry_run = dry_run_raw.lower() in ("true", "1", "yes")
+
+    try:
+        summary = await _run_inventory_sync(dry_run=dry_run)
+    except Exception:
+        logger.exception("UNHANDLED ERROR during inventory sync")
+        return {"status": "error", "dry_run": dry_run, "message": "See server logs"}
+
+    return {"status": "ok", "dry_run": dry_run, "summary": summary}
 
 
 @app.post("/test")
