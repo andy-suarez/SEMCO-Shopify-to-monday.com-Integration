@@ -1355,10 +1355,55 @@ async def shopify_request(
     return None
 
 
-async def _discover_shopify_variants(store_key: str) -> dict:
-    """Return {(texture_lc, color_lc): inventory_item_id} for the store's sample product.
+def _canonical_texture(raw: str) -> str | None:
+    """Normalize a Monday parent name OR Shopify variant texture prefix to a canonical
+    lowercase key derived from TEXTURE_MAP.
 
-    Variant titles are shaped "Corsa/Smooth / Baked Clay" — split on " / ".
+    Examples:
+      "Flex Samples - X-BOND Corsa/Smooth" → "corsa/smooth"
+      "Corsa/Smooth"                        → "corsa/smooth"
+      "corsa"                               → "corsa/smooth"    (short form from Shopify)
+      "vellum"                              → "vellum/natural"
+      "Custom Flex Samples" / "Custom"      → "custom"
+
+    Returns None if the input doesn't match any known texture.
+    """
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+
+    # Strip Monday-style prefixes
+    if s.startswith("flex samples - x-bond "):
+        s = s[len("flex samples - x-bond "):]
+    elif s.startswith("flex samples - "):
+        s = s[len("flex samples - "):]
+    s = s.strip()
+
+    # Custom special case — matches dashboard stripping behavior
+    if s in ("custom", "custom flex samples"):
+        return "custom"
+
+    # Short form (Shopify): match against TEXTURE_MAP keys → canonical value
+    # e.g. "corsa" → TEXTURE_MAP["corsa"] = "Corsa/Smooth" → "corsa/smooth"
+    if s in TEXTURE_MAP:
+        return TEXTURE_MAP[s].lower()
+
+    # Long form (Monday post-strip): match against TEXTURE_MAP values
+    # e.g. "corsa/smooth" matches lowercased "Corsa/Smooth"
+    for short, full in TEXTURE_MAP.items():
+        if s == full.lower():
+            return full.lower()
+
+    # Not recognized
+    return None
+
+
+async def _discover_shopify_variants(store_key: str) -> dict:
+    """Return {(canonical_texture, color_lc): inventory_item_id} for the store's sample product.
+
+    Variant titles are shaped "Corsa / Baked Clay" — split on " / ".
+    Texture side is normalized through TEXTURE_MAP so short forms ("corsa")
+    join correctly with Monday's long forms ("Corsa/Smooth").
     """
     cached = _shopify_variant_cache.get(store_key)
     if cached and (time.time() - cached["refreshed_at"]) < SHOPIFY_VARIANT_CACHE_TTL:
@@ -1388,7 +1433,15 @@ async def _discover_shopify_variants(store_key: str) -> dict:
             skipped += 1
             continue
         texture_raw, color_raw = title.split(" / ", 1)
-        key = (texture_raw.strip().lower(), color_raw.strip().lower())
+        texture_canon = _canonical_texture(texture_raw)
+        if texture_canon is None:
+            logger.warning(
+                "Variant skipped (unknown texture) store=%s id=%s title='%s' texture='%s'",
+                store_key, v.get("id"), title, texture_raw,
+            )
+            skipped += 1
+            continue
+        key = (texture_canon, color_raw.strip().lower())
         if key in variant_map:
             logger.warning(
                 "Duplicate (texture, color) variant in store=%s: %s — last wins (id=%s)",
@@ -1408,25 +1461,28 @@ async def _discover_shopify_variants(store_key: str) -> dict:
 
 
 def _monday_inventory_to_lookup(items: list[dict]) -> dict:
-    """Convert the flat list from _fetch_sample_inventory_data() into {(texture_lc, color_lc): qty}.
+    """Convert the flat list from _fetch_sample_inventory_data() into {(canonical_texture, color_lc): qty}.
 
-    `parent` is like "Flex Samples - Corsa/Smooth"; strip "Flex Samples - " to align with
-    Shopify variant texture. `Custom Flex Samples` becomes "Custom" (matches dashboard behavior).
+    `parent` looks like "Flex Samples - X-BOND Corsa/Smooth"; normalize through _canonical_texture.
     """
     lookup: dict = {}
+    unknown_parents: set[str] = set()
     for item in items:
         parent = (item.get("parent") or "").strip()
-        if parent.startswith("Flex Samples - "):
-            texture = parent[len("Flex Samples - "):]
-        elif parent == "Custom Flex Samples":
-            texture = "Custom"
-        else:
-            texture = parent
-        color = (item.get("color") or "").strip()
-        if not texture or not color:
+        texture_canon = _canonical_texture(parent)
+        if texture_canon is None:
+            unknown_parents.add(parent)
             continue
-        key = (texture.strip().lower(), color.strip().lower())
+        color = (item.get("color") or "").strip()
+        if not color:
+            continue
+        key = (texture_canon, color.lower())
         lookup[key] = int(item.get("quantity") or 0)
+    if unknown_parents:
+        logger.warning(
+            "Monday parents with unknown texture (skipped, not in TEXTURE_MAP): %s",
+            sorted(unknown_parents),
+        )
     return lookup
 
 

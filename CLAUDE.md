@@ -267,9 +267,12 @@ A one-way polling sync pushes sample stock quantities from the Monday.com **Samp
 - Shopify variants without a Monday match → left alone (no zero-out)
 
 ### Texture/color join keys
-- Monday side: parent name `"Flex Samples - Corsa/Smooth"` → `texture = "Corsa/Smooth"`; subitem name → `color`. Both lowercased + stripped.
-- Shopify side: variant title `"Corsa/Smooth / Baked Clay"` → split on ` / ` → `(texture, color)`. Both lowercased + stripped.
-- Special case: `"Custom Flex Samples"` → texture becomes `"Custom"` (matches dashboard behavior).
+Both sides are normalized to a canonical lowercase texture via `_canonical_texture()`, which uses the existing `TEXTURE_MAP`:
+
+- **Monday side:** parent names like `"Flex Samples - X-BOND Corsa/Smooth"` → strip prefix → `"Corsa/Smooth"` → canonical `"corsa/smooth"`. Subitem name → `color` (lowercased + stripped).
+- **Shopify side:** variant titles are in the **short form** `"Corsa / Baked Clay"` (just the texture prefix like `corsa`, `vellum`, not the full `Corsa/Smooth`). Split on ` / `, look up the prefix in `TEXTURE_MAP` → canonical `"corsa/smooth"`.
+- Special case: `"Custom Flex Samples"` → canonical `"custom"`.
+- Variants/parents that don't match any `TEXTURE_MAP` entry are logged as warnings and skipped.
 
 ### Shopify auth (2026 Dev Dashboard flow)
 - Per-store OAuth `client_credentials` grant against `POST /admin/oauth/access_token`
