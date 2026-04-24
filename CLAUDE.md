@@ -296,12 +296,22 @@ Stores without complete config are silently skipped — enables staged rollout (
 
 ### Endpoint
 ```
-POST /sync-inventory[?dry_run=true|1|yes]
-Header: X-Sync-Token: <SYNC_AUTH_TOKEN>
+GET or POST /sync-inventory[?dry_run=true|1|yes][&token=<SYNC_AUTH_TOKEN>]
+Optional header: X-Sync-Token: <SYNC_AUTH_TOKEN>
 ```
-Returns `{"status": "ok", "dry_run": bool, "summary": {...}}`. `dry_run=true` logs what would be set but writes nothing to Shopify.
+Returns `{"status": "ok", "dry_run": bool, "duration_seconds": N, "summary": {...}}`. `dry_run=true` logs what would be set but writes nothing to Shopify.
 
 Per-store summary counts: `matched`, `skipped_missing`, `updated`, `errors`.
+
+**Accepts both GET and POST** so you can trigger a sync from a browser by just visiting the URL.
+
+**Auth is optional:**
+- If `SYNC_AUTH_TOKEN` env var is set, callers must provide a matching token via `X-Sync-Token` header OR `?token=...` query param. Missing/wrong → 401.
+- If `SYNC_AUTH_TOKEN` env var is not set, the endpoint is open (still rate-limited).
+
+**Rate limit:** 1 minute between runs (in-memory, per-process). Concurrent calls get `status: "busy"`; too-soon calls get `status: "rate_limited"` with `retry_in_seconds`. This is a testing-window setting — bump `SYNC_RATE_LIMIT_SECONDS` in `app.py` to 300 (5 min) or higher for production.
+
+**Last-run state** is tracked in memory (`_sync_run_state`): last start/finish timestamps, last dry_run flag, last summary, last error. Useful for quick debugging and for future last-run display.
 
 ### Render Cron Schedule
 - Summer (PDT): `0 13 * * *` UTC → 6 AM PT

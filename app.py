@@ -1204,6 +1204,17 @@ _shopify_token_cache: dict = {}
 _shopify_variant_cache: dict = {}
 SHOPIFY_VARIANT_CACHE_TTL = 24 * 3600  # 24 hours
 
+# Rate limiting + last-run visibility for /sync-inventory
+SYNC_RATE_LIMIT_SECONDS = 60  # 1 minute between syncs (testing window)
+_sync_run_state: dict = {
+    "last_run_started_at": None,    # float (time.time())
+    "last_run_finished_at": None,   # float
+    "last_run_dry_run": None,       # bool
+    "last_run_summary": None,       # dict
+    "last_run_error": None,         # str or None
+    "in_progress": False,
+}
+
 
 async def _shopify_mint_token(store_key: str) -> str | None:
     """Mint (or return cached) Shopify Admin API access token via client_credentials grant."""
@@ -1942,44 +1953,104 @@ async def _safe_process_order(order: dict, store_key: str, order_name: str) -> N
         send_failure_email(store_key, order_name, f"Unhandled exception: {type(e).__name__}: {e}", context="Order processing crashed unexpectedly")
 
 
-@app.post("/sync-inventory")
+@app.api_route("/sync-inventory", methods=["GET", "POST"])
 async def sync_inventory(request: Request):
-    """Trigger Monday → Shopify sample inventory sync. Protected by SYNC_AUTH_TOKEN."""
-    # Request-level logging before auth, for traceability
+    """Trigger Monday → Shopify sample inventory sync.
+
+    Accepts GET (browser-friendly) and POST (for cron/scripts).
+    Auth is optional: if SYNC_AUTH_TOKEN env var is set, callers must provide
+    matching X-Sync-Token header OR ?token=... query param. If the env var is
+    not set, the endpoint is open (still rate-limited).
+
+    Rate-limited to 1 run per %d seconds (in-memory, per-process).
+    """ % SYNC_RATE_LIMIT_SECONDS
     client_ip = (request.client.host if request.client else "unknown")
     user_agent = request.headers.get("user-agent", "(no user-agent)")
-    token = request.headers.get("X-Sync-Token", "")
+    method = request.method
+
+    # Accept token in header OR query param (for easy browser triggering)
+    token = (
+        request.headers.get("X-Sync-Token")
+        or request.query_params.get("token", "")
+        or ""
+    )
     dry_run_raw = request.query_params.get("dry_run", "")
     dry_run = dry_run_raw.lower() in ("true", "1", "yes")
 
     logger.info(
-        "/sync-inventory called from ip=%s ua='%s' dry_run=%s token_present=%s",
-        client_ip, user_agent, dry_run, bool(token),
+        "/sync-inventory called method=%s ip=%s ua='%s' dry_run=%s token_present=%s auth_configured=%s",
+        method, client_ip, user_agent, dry_run, bool(token), bool(SYNC_AUTH_TOKEN),
     )
 
-    if not SYNC_AUTH_TOKEN:
-        logger.error(
-            "/sync-inventory REJECTED: SYNC_AUTH_TOKEN not configured on server (ip=%s)",
-            client_ip,
-        )
-        return Response(status_code=401, content="Unauthorized")
-    if not hmac.compare_digest(token, SYNC_AUTH_TOKEN):
-        logger.warning("/sync-inventory REJECTED: invalid X-Sync-Token (ip=%s)", client_ip)
-        return Response(status_code=401, content="Unauthorized")
+    # Optional auth — only enforced if SYNC_AUTH_TOKEN env var is set
+    if SYNC_AUTH_TOKEN:
+        if not token or not hmac.compare_digest(token, SYNC_AUTH_TOKEN):
+            logger.warning("/sync-inventory REJECTED: invalid or missing token (ip=%s)", client_ip)
+            return Response(status_code=401, content="Unauthorized")
+        logger.info("/sync-inventory AUTH OK (token matched)")
+    else:
+        logger.info("/sync-inventory AUTH SKIPPED (SYNC_AUTH_TOKEN not configured — endpoint is open)")
 
-    logger.info("/sync-inventory AUTH OK — starting sync (dry_run=%s)", dry_run)
+    # Rate limit check
+    now = time.time()
+    last_start = _sync_run_state.get("last_run_started_at") or 0.0
+    seconds_since = now - last_start
+
+    if _sync_run_state["in_progress"]:
+        logger.warning("/sync-inventory REJECTED: another sync is already in progress (ip=%s)", client_ip)
+        return {
+            "status": "busy",
+            "message": "A sync is already in progress — try again in a moment",
+            "last_run_summary": _sync_run_state.get("last_run_summary"),
+        }
+
+    if last_start > 0 and seconds_since < SYNC_RATE_LIMIT_SECONDS:
+        retry_in = int(SYNC_RATE_LIMIT_SECONDS - seconds_since)
+        logger.warning(
+            "/sync-inventory RATE LIMITED: last run was %.1fs ago, window is %ds (ip=%s)",
+            seconds_since, SYNC_RATE_LIMIT_SECONDS, client_ip,
+        )
+        return {
+            "status": "rate_limited",
+            "message": f"Last sync was {int(seconds_since)}s ago. Try again in {retry_in}s.",
+            "rate_limit_seconds": SYNC_RATE_LIMIT_SECONDS,
+            "retry_in_seconds": retry_in,
+            "last_run_summary": _sync_run_state.get("last_run_summary"),
+        }
+
+    # Run the sync
+    _sync_run_state["in_progress"] = True
+    _sync_run_state["last_run_started_at"] = now
+    _sync_run_state["last_run_dry_run"] = dry_run
+    _sync_run_state["last_run_error"] = None
+
+    logger.info("/sync-inventory STARTING sync (dry_run=%s)", dry_run)
 
     try:
         summary = await _run_inventory_sync(dry_run=dry_run)
-    except Exception:
+        _sync_run_state["last_run_summary"] = summary
+    except Exception as e:
         logger.exception("UNHANDLED ERROR during inventory sync")
-        return {"status": "error", "dry_run": dry_run, "message": "See server logs"}
+        _sync_run_state["last_run_error"] = f"{type(e).__name__}: {e}"
+        _sync_run_state["last_run_summary"] = None
+        _sync_run_state["last_run_finished_at"] = time.time()
+        _sync_run_state["in_progress"] = False
+        return {"status": "error", "dry_run": dry_run, "message": "See server logs", "error": _sync_run_state["last_run_error"]}
 
+    _sync_run_state["last_run_finished_at"] = time.time()
+    _sync_run_state["in_progress"] = False
+
+    duration = _sync_run_state["last_run_finished_at"] - _sync_run_state["last_run_started_at"]
     logger.info(
-        "/sync-inventory responding 200: dry_run=%s summary=%s",
-        dry_run, summary,
+        "/sync-inventory responding 200: dry_run=%s duration=%.1fs summary=%s",
+        dry_run, duration, summary,
     )
-    return {"status": "ok", "dry_run": dry_run, "summary": summary}
+    return {
+        "status": "ok",
+        "dry_run": dry_run,
+        "duration_seconds": round(duration, 1),
+        "summary": summary,
+    }
 
 
 @app.post("/test")
