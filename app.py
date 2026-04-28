@@ -71,22 +71,36 @@ MONDAY_API_URL = "https://api.monday.com/v2"
 # Sample Inventory Sync — Monday → Shopify (one-way, polling via Render Cron)
 # Isolated from the webhook-receive path above.
 # ---------------------------------------------------------------------------
+# Shared OAuth credentials for the Dev Dashboard app (one app, multiple store
+# installs — same client_id/secret used to mint a per-store access token).
+# Falls back to the legacy SHOPIFY_PRO_CLIENT_ID/SECRET names if the new shared
+# names aren't set, so existing Render env vars keep working during migration.
+SHOPIFY_CLIENT_ID = (
+    os.environ.get("SHOPIFY_CLIENT_ID")
+    or os.environ.get("SHOPIFY_PRO_CLIENT_ID", "")
+)
+SHOPIFY_CLIENT_SECRET = (
+    os.environ.get("SHOPIFY_CLIENT_SECRET")
+    or os.environ.get("SHOPIFY_PRO_CLIENT_SECRET", "")
+)
+
+# Per-store config — only what differs between installs.
+# `variant_format`:
+#   "pro"    → variant title is "Corsa / Baked Clay" (split on " / ")
+#   "spaces" → variant title IS the color (texture is implicit Corsa/Smooth)
 SHOPIFY_SYNC_STORES = {
     "semco_pro": {
         "domain": os.environ.get("SHOPIFY_PRO_STORE_DOMAIN", ""),
-        "client_id": os.environ.get("SHOPIFY_PRO_CLIENT_ID", ""),
-        "client_secret": os.environ.get("SHOPIFY_PRO_CLIENT_SECRET", ""),
         "location_id": os.environ.get("SHOPIFY_PRO_LOCATION_ID", ""),
         "product_id": os.environ.get("SHOPIFY_PRO_SAMPLE_PRODUCT_ID", ""),
+        "variant_format": "pro",
     },
-    # Spaces added later as a config-only change:
-    # "semco_spaces": {
-    #     "domain": os.environ.get("SHOPIFY_SPACES_STORE_DOMAIN", ""),
-    #     "client_id": os.environ.get("SHOPIFY_SPACES_CLIENT_ID", ""),
-    #     "client_secret": os.environ.get("SHOPIFY_SPACES_CLIENT_SECRET", ""),
-    #     "location_id": os.environ.get("SHOPIFY_SPACES_LOCATION_ID", ""),
-    #     "product_id": os.environ.get("SHOPIFY_SPACES_SAMPLE_PRODUCT_ID", ""),
-    # },
+    "semco_spaces": {
+        "domain": os.environ.get("SHOPIFY_SPACES_STORE_DOMAIN", ""),
+        "location_id": os.environ.get("SHOPIFY_SPACES_LOCATION_ID", ""),
+        "product_id": os.environ.get("SHOPIFY_SPACES_SAMPLE_PRODUCT_ID", ""),
+        "variant_format": "spaces",
+    },
 }
 
 SYNC_AUTH_TOKEN = os.environ.get("SYNC_AUTH_TOKEN", "")
@@ -95,10 +109,11 @@ SHOPIFY_API_VERSION = "2024-10"
 
 def _sync_store_is_configured(key: str) -> bool:
     s = SHOPIFY_SYNC_STORES.get(key, {})
+    # Shared credentials must be set for any store to be considered configured
+    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        return False
     return all([
         s.get("domain"),
-        s.get("client_id"),
-        s.get("client_secret"),
         s.get("location_id"),
         s.get("product_id"),
     ])
@@ -1217,7 +1232,10 @@ _sync_run_state: dict = {
 
 
 async def _shopify_mint_token(store_key: str) -> str | None:
-    """Mint (or return cached) Shopify Admin API access token via client_credentials grant."""
+    """Mint (or return cached) Shopify Admin API access token via client_credentials grant.
+
+    Uses the shared SHOPIFY_CLIENT_ID/SECRET (one app, many store installs in the same org).
+    """
     cached = _shopify_token_cache.get(store_key)
     if cached and cached["expires_at"] > time.time() + 60:
         return cached["token"]
@@ -1227,10 +1245,17 @@ async def _shopify_mint_token(store_key: str) -> str | None:
         logger.error("Shopify token mint: unknown store_key '%s'", store_key)
         return None
 
+    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        logger.error(
+            "Shopify token mint FAILED: SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET not configured (store=%s)",
+            store_key,
+        )
+        return None
+
     url = f"https://{cfg['domain']}/admin/oauth/access_token"
     payload = {
-        "client_id": cfg["client_id"],
-        "client_secret": cfg["client_secret"],
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
         "grant_type": "client_credentials",
     }
     try:
@@ -1401,20 +1426,24 @@ def _canonical_texture(raw: str) -> str | None:
 async def _discover_shopify_variants(store_key: str) -> dict:
     """Return {(canonical_texture, color_lc): inventory_item_id} for the store's sample product.
 
-    Variant titles are shaped "Corsa / Baked Clay" — split on " / ".
-    Texture side is normalized through TEXTURE_MAP so short forms ("corsa")
-    join correctly with Monday's long forms ("Corsa/Smooth").
+    Variant title parsing depends on the store's `variant_format`:
+      - "pro"    : "Corsa / Baked Clay" → split on " / " → (texture, color)
+      - "spaces" : "Phantom"           → title IS the color; texture is forced
+                                          to the implicit "corsa/smooth"
     """
     cached = _shopify_variant_cache.get(store_key)
     if cached and (time.time() - cached["refreshed_at"]) < SHOPIFY_VARIANT_CACHE_TTL:
         return cached["map"]
 
     cfg = SHOPIFY_SYNC_STORES[store_key]
+    variant_format = cfg.get("variant_format", "pro")
     path = f"/products/{cfg['product_id']}/variants.json?limit=250"
     resp = await shopify_request(store_key, "GET", path)
     if not resp:
         logger.error("Variant discovery FAILED for store '%s'", store_key)
         return {}
+
+    spaces_implicit_texture = TEXTURE_MAP["corsa"].lower()  # "corsa/smooth"
 
     variants = resp.get("variants", []) or []
     variant_map: dict = {}
@@ -1425,22 +1454,30 @@ async def _discover_shopify_variants(store_key: str) -> dict:
         if not title or inventory_item_id is None:
             skipped += 1
             continue
-        if " / " not in title:
-            logger.warning(
-                "Variant skipped (no ' / ' separator) store=%s id=%s title='%s'",
-                store_key, v.get("id"), title,
-            )
-            skipped += 1
-            continue
-        texture_raw, color_raw = title.split(" / ", 1)
-        texture_canon = _canonical_texture(texture_raw)
-        if texture_canon is None:
-            logger.warning(
-                "Variant skipped (unknown texture) store=%s id=%s title='%s' texture='%s'",
-                store_key, v.get("id"), title, texture_raw,
-            )
-            skipped += 1
-            continue
+
+        if variant_format == "spaces":
+            # Spaces: title is just the color; texture is implicit Corsa/Smooth
+            texture_canon = spaces_implicit_texture
+            color_raw = title
+        else:
+            # Pro: split on " / "
+            if " / " not in title:
+                logger.warning(
+                    "Variant skipped (no ' / ' separator) store=%s id=%s title='%s'",
+                    store_key, v.get("id"), title,
+                )
+                skipped += 1
+                continue
+            texture_raw, color_raw = title.split(" / ", 1)
+            texture_canon = _canonical_texture(texture_raw)
+            if texture_canon is None:
+                logger.warning(
+                    "Variant skipped (unknown texture) store=%s id=%s title='%s' texture='%s'",
+                    store_key, v.get("id"), title, texture_raw,
+                )
+                skipped += 1
+                continue
+
         key = (texture_canon, color_raw.strip().lower())
         if key in variant_map:
             logger.warning(
@@ -1534,16 +1571,19 @@ async def _run_inventory_sync(dry_run: bool = False) -> dict:
     unconfigured_stores = [k for k in SHOPIFY_SYNC_STORES if not _sync_store_is_configured(k)]
     logger.info("CONFIG: monday_sample_board_id=%s", MONDAY_SAMPLE_BOARD_ID or "(not set)")
     logger.info("CONFIG: shopify_api_version=%s", SHOPIFY_API_VERSION)
+    logger.info(
+        "CONFIG: shopify_client_id_prefix=%s",
+        (SHOPIFY_CLIENT_ID[:8] + "...") if SHOPIFY_CLIENT_ID else "(missing)",
+    )
     logger.info("CONFIG: configured_stores=%s", configured_stores or "(none)")
     if unconfigured_stores:
         logger.info("CONFIG: unconfigured_stores (skipped)=%s", unconfigured_stores)
     for key in configured_stores:
         cfg = SHOPIFY_SYNC_STORES[key]
-        # Only log non-secret config fields
         logger.info(
-            "CONFIG store=%s domain=%s location_id=%s product_id=%s client_id_prefix=%s",
-            key, cfg.get("domain"), cfg.get("location_id"), cfg.get("product_id"),
-            (cfg.get("client_id") or "")[:8] + "..." if cfg.get("client_id") else "(missing)",
+            "CONFIG store=%s domain=%s location_id=%s product_id=%s variant_format=%s",
+            key, cfg.get("domain"), cfg.get("location_id"),
+            cfg.get("product_id"), cfg.get("variant_format"),
         )
 
     if not configured_stores:

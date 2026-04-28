@@ -275,27 +275,39 @@ Both sides are normalized to a canonical lowercase texture via `_canonical_textu
 - Variants/parents that don't match any `TEXTURE_MAP` entry are logged as warnings and skipped.
 
 ### Shopify auth (2026 Dev Dashboard flow)
-- Per-store OAuth `client_credentials` grant against `POST /admin/oauth/access_token`
-- Each store install has its own `client_id` + `client_secret` (they are NOT shared across stores)
-- Access token cached in memory for 24h; re-minted on 401 or expiry
-- `X-Shopify-Access-Token` header on all REST calls
-- Uses Shopify Admin REST API version `2024-10`
-- 429 responses honor `Retry-After` and retry once
+- Single OAuth `client_credentials` grant per store install — but all installs of the **same app** in the same org share **one** Client ID + Secret (Shopify's Dev Dashboard issues credentials at the app level, not per-install).
+- Token mint POSTs to each store's own `https://{store}.myshopify.com/admin/oauth/access_token` and gets back a **store-specific** access token.
+- Access token cached in memory per-store for 24h; re-minted on 401 or expiry.
+- `X-Shopify-Access-Token` header on all REST calls.
+- Uses Shopify Admin REST API version `2024-10`.
+- 429 responses honor `Retry-After` and retry once.
 
 ### Environment Variables (sync-specific)
 
-| Variable | Description |
-|----------|-------------|
-| `SHOPIFY_PRO_STORE_DOMAIN` | e.g. `semcopro.myshopify.com` |
-| `SHOPIFY_PRO_CLIENT_ID` | OAuth client ID from Dev Dashboard → Settings (Pro install) |
-| `SHOPIFY_PRO_CLIENT_SECRET` | OAuth client secret (Pro install) |
-| `SHOPIFY_PRO_LOCATION_ID` | Shopify location ID where sample stock lives |
-| `SHOPIFY_PRO_SAMPLE_PRODUCT_ID` | Sample product ID on the Pro store |
-| `SYNC_AUTH_TOKEN` | Shared secret header for `/sync-inventory` (random 32+ chars) |
+| Variable | Scope | Description |
+|----------|-------|-------------|
+| `SHOPIFY_CLIENT_ID` | shared | OAuth client ID from Dev Dashboard → Settings (one app, all installs) |
+| `SHOPIFY_CLIENT_SECRET` | shared | OAuth client secret (one app, all installs) |
+| `SHOPIFY_PRO_STORE_DOMAIN` | per-store | e.g. `semcopro.myshopify.com` |
+| `SHOPIFY_PRO_LOCATION_ID` | per-store | Shopify location ID where Pro sample stock lives |
+| `SHOPIFY_PRO_SAMPLE_PRODUCT_ID` | per-store | Sample product ID on Pro |
+| `SHOPIFY_SPACES_STORE_DOMAIN` | per-store | e.g. `semcospaces.myshopify.com` |
+| `SHOPIFY_SPACES_LOCATION_ID` | per-store | Shopify location ID where Spaces sample stock lives |
+| `SHOPIFY_SPACES_SAMPLE_PRODUCT_ID` | per-store | Sample product ID on Spaces |
+| `SYNC_AUTH_TOKEN` | optional | Shared secret for `/sync-inventory`. If unset, endpoint is open. |
 
 `MONDAY_SAMPLE_BOARD_ID` is reused from the existing sample inventory config.
 
-Stores without complete config are silently skipped — enables staged rollout (Pro now, Spaces later).
+Stores without complete config (missing `domain`/`location_id`/`product_id`) are silently skipped — enables staged rollout. The shared `SHOPIFY_CLIENT_ID`/`SECRET` must be set for any store to be considered configured.
+
+**Backwards-compat:** Legacy `SHOPIFY_PRO_CLIENT_ID` / `SHOPIFY_PRO_CLIENT_SECRET` env vars still work as a fallback if the new shared names aren't set. Migrate when convenient.
+
+### Per-store variant title formats
+
+Each entry in `SHOPIFY_SYNC_STORES` has a `variant_format` flag that controls how Shopify variant titles are parsed:
+
+- **`"pro"`** — variant titles look like `"Corsa / Baked Clay"`. Split on ` / ` → `(texture, color)`. Texture is normalized via `_canonical_texture()` using `TEXTURE_MAP`.
+- **`"spaces"`** — variant titles are just the color, e.g. `"Phantom"`. Texture is implicitly hardcoded to `corsa/smooth` (Spaces only sells Corsa samples).
 
 ### Endpoint
 ```
@@ -326,11 +338,11 @@ Per-store summary counts: `matched`, `skipped_missing`, `updated`, `errors`.
     "https://<render-url>/sync-inventory"
   ```
 
-### Adding SEMCO Spaces later
-1. Install the Dev Dashboard app on `semcospaces.myshopify.com` → copy its (distinct) Client ID + Secret from Settings
-2. Add Spaces env vars (`SHOPIFY_SPACES_*`) in Render
-3. Uncomment the `semco_spaces` block in `SHOPIFY_SYNC_STORES` in `app.py`
-4. Redeploy — sync will pick up Spaces automatically
+### Adding more stores in the future
+1. Install the Dev Dashboard app on the additional store (no new credentials needed — `SHOPIFY_CLIENT_ID`/`SECRET` are reused across all installs of the same app).
+2. Add the store's `*_STORE_DOMAIN`, `*_LOCATION_ID`, `*_SAMPLE_PRODUCT_ID` env vars in Render.
+3. Add a new entry to `SHOPIFY_SYNC_STORES` in `app.py` with the appropriate `variant_format` (`"pro"` or `"spaces"`).
+4. Redeploy — sync will pick up the new store automatically.
 
 ### Isolation from order processing
 - Uses its own config dict (`SHOPIFY_SYNC_STORES`) — separate from webhook `STORES`
