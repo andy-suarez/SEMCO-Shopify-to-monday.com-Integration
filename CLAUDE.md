@@ -328,7 +328,7 @@ Per-store summary counts: `matched`, `skipped_missing`, `updated`, `errors`.
 - If `SYNC_AUTH_TOKEN` env var is set, callers must provide a matching token via `X-Sync-Token` header OR `?token=...` query param. Missing/wrong → 401.
 - If `SYNC_AUTH_TOKEN` env var is not set, the endpoint is open (still rate-limited).
 
-**Rate limit:** 1 minute between runs (in-memory, per-process). Concurrent calls get `status: "busy"`; too-soon calls get `status: "rate_limited"` with `retry_in_seconds`. This is a testing-window setting — bump `SYNC_RATE_LIMIT_SECONDS` in `app.py` to 300 (5 min) or higher for production.
+**Rate limit:** 5 minutes between runs (in-memory, per-process). Concurrent calls get `status: "busy"`; too-soon calls get `status: "rate_limited"` with `retry_in_seconds`. Daily cron only needs ~60s/run, so 300s blocks accidental rapid re-fires. Tune `SYNC_RATE_LIMIT_SECONDS` in `app.py` if needed.
 
 **Last-run state** is tracked in memory (`_sync_run_state`): last start/finish timestamps, last dry_run flag, last summary, last error. Useful for quick debugging and for future last-run display.
 

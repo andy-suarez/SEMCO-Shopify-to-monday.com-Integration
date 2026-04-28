@@ -1248,7 +1248,7 @@ _shopify_variant_cache: dict = {}
 SHOPIFY_VARIANT_CACHE_TTL = 24 * 3600  # 24 hours
 
 # Rate limiting + last-run visibility for /sync-inventory
-SYNC_RATE_LIMIT_SECONDS = 60  # 1 minute between syncs (testing window)
+SYNC_RATE_LIMIT_SECONDS = 300  # 5 minutes between syncs — daily cron only needs ~60s/run, this blocks accidental rapid re-fires
 _sync_run_state: dict = {
     "last_run_started_at": None,    # float (time.time())
     "last_run_finished_at": None,   # float
