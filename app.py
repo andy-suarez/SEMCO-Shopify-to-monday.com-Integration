@@ -700,12 +700,15 @@ async def monday_request(query: str, variables: dict) -> dict | None:
 
 
 async def create_parent_item(item_name: str, column_values: dict) -> str | None:
+    # create_labels_if_missing auto-creates status/dropdown labels that don't
+    # yet exist on the board (e.g. a new "Type" value after a monthly rotation).
     query = """
     mutation ($boardId: ID!, $itemName: String!, $columnValues: JSON!) {
         create_item(
             board_id: $boardId,
             item_name: $itemName,
-            column_values: $columnValues
+            column_values: $columnValues,
+            create_labels_if_missing: true
         ) {
             id
         }
