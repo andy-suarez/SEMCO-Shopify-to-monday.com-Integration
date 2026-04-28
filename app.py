@@ -1700,6 +1700,46 @@ async def _run_inventory_sync(dry_run: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Startup — pre-warm column caches so the first webhook isn't blocked on
+# Monday.com discovery (which can take 30s+ when the API is slow and would
+# otherwise leave that order with empty column values).
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+async def _on_startup() -> None:
+    asyncio.create_task(_warmup_caches())
+
+
+async def _warmup_caches() -> None:
+    """Discover column IDs for the orders board and the sample board on startup.
+
+    Runs in the background so uvicorn starts serving immediately. Retries with
+    backoff because Monday.com occasionally takes >30s to respond. If all
+    attempts fail, the existing lazy discovery in process_order/log_sample_order
+    will retry on demand.
+    """
+    for attempt in range(1, 4):
+        await asyncio.gather(
+            _discover_column_ids(),
+            _discover_sample_board(),
+            return_exceptions=True,
+        )
+        orders_ok = bool(_column_cache.get("parent"))
+        sample_ok = bool(_sample_board_cache.get("subitem_qty_col"))
+        if orders_ok and sample_ok:
+            logger.info("STARTUP WARMUP complete on attempt %d (orders + sample caches populated)", attempt)
+            return
+        logger.warning(
+            "STARTUP WARMUP attempt %d incomplete: orders_cache=%s sample_cache=%s",
+            attempt, orders_ok, sample_ok,
+        )
+        await asyncio.sleep(min(2 ** attempt, 10))
+
+    logger.error(
+        "STARTUP WARMUP gave up after 3 attempts — webhooks will fall back to on-demand discovery"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
