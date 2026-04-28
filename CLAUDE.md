@@ -4,7 +4,7 @@
 
 A Python/FastAPI web service that receives Shopify `orders/create` webhooks from four stores (SEMCO Pro, SEMCO Spaces, SEMCO Connect, and SEMCO Works) and creates structured items on a Monday.com board in real time. Parent items represent orders; subitems represent individual products.
 
-Additionally manages a **Sample Inventory board** that tracks sample stock across Pro and Spaces stores, auto-decrementing quantities when sample orders come in.
+Additionally manages a **Sample Inventory board** that tracks sample stock across Pro, Spaces, and Connect stores, auto-decrementing quantities when sample orders come in.
 
 Deployed as a Docker container on Render (Starter plan, always-on).
 
@@ -54,7 +54,7 @@ All config is via environment variables (no `.env` in production). Column IDs ar
 |-----------|--------------|------------------------|--------------|-------|
 | `semco_pro` | SEMCO Pro | `SEMCO SURFACE` | `/webhook/semco_pro` | Full orders + sample inventory |
 | `semco_spaces` | SEMCO Spaces | `SEMCO SPACES` | `/webhook/semco_spaces` | Full orders + sample inventory |
-| `semco_connect` | SEMCO Connect | `SEMCO CONNECT` | `/webhook/semco_connect` | Full orders only |
+| `semco_connect` | SEMCO Connect | `SEMCO CONNECT` | `/webhook/semco_connect` | Full orders + sample inventory |
 | `semco_works` | SEMCO Works | `SEMCO WORKS` | `/webhook/semco_works` | LTL and Will Call orders only |
 
 ## Column Auto-Discovery
@@ -147,7 +147,7 @@ Water Based Building Products
 
 ## Sample Inventory System
 
-SEMCO Pro and Spaces both sell sample products from a shared physical inventory. The system routes sample orders to a dedicated **Sample Inventory board** on Monday.com.
+SEMCO Pro, Spaces, and Connect sell sample products from a shared physical inventory. The system routes sample orders to a dedicated **Sample Inventory board** on Monday.com.
 
 ### Two Boards
 - **Orders Board** (`MONDAY_BOARD_ID`): Rotated monthly. Full orders with all line items.
@@ -159,15 +159,16 @@ The Sample Inventory board has two groups:
 
 1. **Sample Inventory** — Parent items are texture lines (Corsa/Smooth, Vellum/Natural, Polished, Solid, Grain, ADA, Custom). Each parent has color subitems (Baked Clay, Black Pearl, Blanco, etc.) with a `Quantity1` column tracking current stock.
 
-2. **Sample Requests Log** — Orders containing samples are logged here as parent items with subitems for each sample color ordered.
+2. **Sample Requests Log** — Orders containing samples are logged here as parent items with subitems for each sample color ordered. Parent items have a `Type` status column populated with the originating store (`SEMCO SURFACE`, `SEMCO SPACES`, `SEMCO CONNECT`, or `SEMCO WORKS`) — same labels as the orders board's Type column.
 
 ### Sample Detection
 
 Products are identified as samples by matching titles against `SAMPLE_PRODUCT_NAMES`:
 - `"architectural sample kits"` (Pro)
 - `"x-bond microcement physical color samples"` (Spaces)
+- Connect: confirm and add the exact Connect sample product title (substring-matched, case-insensitive)
 
-### Three Order Scenarios (Pro & Spaces)
+### Three Order Scenarios (Pro, Spaces, Connect)
 
 1. **Sample-only order** → Skips the orders board entirely. Logs to Sample Requests Log and decrements inventory.
 2. **Mixed order (samples + regular products)** → Posts the full order (all items) to the orders board AND also logs just the sample items to the Sample Requests Log with inventory decrement.
@@ -175,7 +176,7 @@ Products are identified as samples by matching titles against `SAMPLE_PRODUCT_NA
 
 ### Texture/Color Parsing from Shopify Variant Titles
 
-**Pro format:** `"Corsa / Polar Bear"` — splits on ` / ` to extract texture prefix and color name. Texture prefix is mapped via `TEXTURE_MAP` (e.g., `corsa` → `Corsa/Smooth`, `vellum` → `Vellum/Natural`). Unknown textures default to `Corsa/Smooth`.
+**Pro/Connect format:** `"Corsa / Polar Bear"` — splits on ` / ` to extract texture prefix and color name. Texture prefix is mapped via `TEXTURE_MAP` (e.g., `corsa` → `Corsa/Smooth`, `vellum` → `Vellum/Natural`). Unknown textures default to `Corsa/Smooth`. Connect is assumed to use this format; flip to Spaces format below if its variants are just the color.
 
 **Spaces format:** `"Phantom"` — variant title IS the color. Texture is always `Corsa/Smooth` (Spaces only sells Corsa samples).
 
@@ -294,6 +295,9 @@ Both sides are normalized to a canonical lowercase texture via `_canonical_textu
 | `SHOPIFY_SPACES_STORE_DOMAIN` | per-store | e.g. `semcospaces.myshopify.com` |
 | `SHOPIFY_SPACES_LOCATION_ID` | per-store | Shopify location ID where Spaces sample stock lives |
 | `SHOPIFY_SPACES_SAMPLE_PRODUCT_ID` | per-store | Sample product ID on Spaces |
+| `SHOPIFY_CONNECT_STORE_DOMAIN` | per-store | e.g. `semcoconnect.myshopify.com` |
+| `SHOPIFY_CONNECT_LOCATION_ID` | per-store | Shopify location ID where Connect sample stock lives |
+| `SHOPIFY_CONNECT_SAMPLE_PRODUCT_ID` | per-store | Sample product ID on Connect |
 | `SYNC_AUTH_TOKEN` | optional | Shared secret for `/sync-inventory`. If unset, endpoint is open. |
 
 `MONDAY_SAMPLE_BOARD_ID` is reused from the existing sample inventory config.

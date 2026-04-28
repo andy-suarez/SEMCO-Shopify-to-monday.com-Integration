@@ -101,6 +101,12 @@ SHOPIFY_SYNC_STORES = {
         "product_id": os.environ.get("SHOPIFY_SPACES_SAMPLE_PRODUCT_ID", ""),
         "variant_format": "spaces",
     },
+    "semco_connect": {
+        "domain": os.environ.get("SHOPIFY_CONNECT_STORE_DOMAIN", ""),
+        "location_id": os.environ.get("SHOPIFY_CONNECT_LOCATION_ID", ""),
+        "product_id": os.environ.get("SHOPIFY_CONNECT_SAMPLE_PRODUCT_ID", ""),
+        "variant_format": "pro",  # assumes "Corsa / Color" — flip to "spaces" if Connect uses just the color
+    },
 }
 
 SYNC_AUTH_TOKEN = os.environ.get("SYNC_AUTH_TOKEN", "")
@@ -285,6 +291,7 @@ _sample_board_cache: dict = {
     "subitem_qty_col": None,      # Subitem Quantity column ID (numbers6)
     "subitem_label_col": None,    # Subitem Label column ID (text — "X-BOND Corsa/Smooth — Mojave")
     "subitem_times_col": None,    # Subitem Times Ordered column ID (numbers — running counter)
+    "parent_type_col": None,      # Status column on log parent items — store name (SEMCO SURFACE/SPACES/CONNECT/WORKS)
     "inventory": {},              # {"Corsa/Smooth": {"item_id": "123", "colors": {"rawhide": {...}, ...}}, ...}
 }
 
@@ -327,11 +334,12 @@ async def _discover_sample_board() -> None:
     if not log_group_id:
         logger.error("SAMPLE BOARD DISCOVERY FAILED: Group '%s' not found on board %s", SAMPLE_LOG_GROUP_NAME, board_id)
 
-    # Find subitem board and columns (Quantity, Label, Times Ordered)
+    # Find parent-board columns: subitem ref + "Type" status column for log entries
     subitem_qty_col = None
     subitem_label_col = None
     subitem_times_col = None
     subitem_board_id = None
+    parent_type_col = None
     for col in board_data.get("columns", []):
         if col["type"] == "subtasks":
             try:
@@ -342,6 +350,9 @@ async def _discover_sample_board() -> None:
                     logger.info("  Found sample subitem board ID: %s", subitem_board_id)
             except (json.JSONDecodeError, KeyError):
                 pass
+        elif col["title"] == "Type":
+            parent_type_col = col["id"]
+            logger.info("  MATCHED sample board parent column 'Type' → ID: %s (type: %s)", parent_type_col, col["type"])
 
     if subitem_board_id:
         col_query = """
@@ -446,9 +457,10 @@ async def _discover_sample_board() -> None:
     _sample_board_cache["subitem_qty_col"] = subitem_qty_col
     _sample_board_cache["subitem_label_col"] = subitem_label_col
     _sample_board_cache["subitem_times_col"] = subitem_times_col
+    _sample_board_cache["parent_type_col"] = parent_type_col
     _sample_board_cache["inventory"] = inventory
-    logger.info("Sample board discovery complete: log_group=%s, subitem_board=%s, qty_col=%s, label_col=%s, times_col=%s, inventory_items=%d",
-                log_group_id, subitem_board_id, subitem_qty_col, subitem_label_col, subitem_times_col, len(inventory))
+    logger.info("Sample board discovery complete: log_group=%s, subitem_board=%s, qty_col=%s, label_col=%s, times_col=%s, parent_type_col=%s, inventory_items=%d",
+                log_group_id, subitem_board_id, subitem_qty_col, subitem_label_col, subitem_times_col, parent_type_col, len(inventory))
 
     # Populate Label column for any subitems that are missing it
     if labels_to_populate and subitem_board_id and subitem_label_col:
@@ -793,13 +805,16 @@ async def create_update(item_id: str, body_text: str) -> bool:
 
 async def create_item_in_group(board_id: str, group_id: str, item_name: str, column_values: dict | None = None) -> str | None:
     """Create an item in a specific group on a Monday.com board."""
+    # create_labels_if_missing auto-creates status/dropdown labels that don't yet
+    # exist (e.g. a new "Type" value if a label was renamed on the sample board).
     query = """
     mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnValues: JSON!) {
         create_item(
             board_id: $boardId,
             group_id: $groupId,
             item_name: $itemName,
-            column_values: $columnValues
+            column_values: $columnValues,
+            create_labels_if_missing: true
         ) {
             id
         }
@@ -848,8 +863,18 @@ async def log_sample_order(order: dict, store_key: str) -> None:
     else:
         item_name = f"{contact} / Order{order_name}"
 
+    # Build parent column values — set Type to the store name (matches orders board labels)
+    parent_columns: dict = {}
+    parent_type_col = _sample_board_cache.get("parent_type_col")
+    type_label = STORES.get(store_key, {}).get("type_label")
+    if parent_type_col and type_label:
+        parent_columns[parent_type_col] = {"label": type_label}
+        logger.info("SAMPLE LOG: Setting parent 'Type' → '%s'", type_label)
+    elif not parent_type_col:
+        logger.warning("SAMPLE LOG: 'Type' column not found on sample board — skipping store label on parent")
+
     # Create parent item in the log group
-    parent_id = await create_item_in_group(MONDAY_SAMPLE_BOARD_ID, log_group_id, item_name)
+    parent_id = await create_item_in_group(MONDAY_SAMPLE_BOARD_ID, log_group_id, item_name, parent_columns)
     if not parent_id:
         logger.error("FAILED to log sample order %s to sample board", order_name)
         return
@@ -867,9 +892,9 @@ async def log_sample_order(order: dict, store_key: str) -> None:
         variant_title = (li.get("variant_title") or "").strip()
 
         # Parse texture and color based on store
-        # Pro format: variant_title = "Corsa / Polar Bear" → texture=Corsa/Smooth, color=Polar Bear
+        # Pro/Connect format: variant_title = "Corsa / Polar Bear" → texture=Corsa/Smooth, color=Polar Bear
         # Spaces format: variant_title = "Phantom" → texture=Corsa/Smooth (always), color=Phantom
-        if store_key == "semco_pro" and " / " in variant_title:
+        if store_key in ("semco_pro", "semco_connect") and " / " in variant_title:
             parts_split = variant_title.split(" / ", 1)
             texture_prefix = parts_split[0].strip().lower()
             color_name = parts_split[1].strip()
@@ -880,10 +905,10 @@ async def log_sample_order(order: dict, store_key: str) -> None:
                     texture_label = label
                     break
             if not texture_label:
-                logger.warning("Unknown texture prefix '%s' from Pro sample — defaulting to Corsa/Smooth", texture_prefix)
+                logger.warning("Unknown texture prefix '%s' from %s sample — defaulting to Corsa/Smooth", texture_prefix, store_key)
                 texture_label = "Corsa/Smooth"
         else:
-            # Spaces: always Corsa/Smooth, variant_title is the color
+            # Spaces (or Connect/Pro variant without slash): variant_title is the color, texture is Corsa/Smooth
             texture_label = "Corsa/Smooth"
             color_name = variant_title
 
@@ -1049,14 +1074,14 @@ async def process_order(order: dict, store_key: str) -> None:
     # Filter out sample-only orders
     if _is_sample_only_order(order):
         logger.info("SKIPPING ORDER %s: Contains only sample items — not posting to order board", order_name)
-        # Log sample orders from Pro and Spaces to the Sample Requests Log board
-        if store_key in ("semco_pro", "semco_spaces"):
+        # Log sample orders from Pro, Spaces, and Connect to the Sample Requests Log board
+        if store_key in ("semco_pro", "semco_spaces", "semco_connect"):
             await log_sample_order(order, store_key)
         return
 
     # Mixed orders (samples + regular products): post full order to orders board AND
     # log just the sample items to the sample inventory board
-    if store_key in ("semco_pro", "semco_spaces"):
+    if store_key in ("semco_pro", "semco_spaces", "semco_connect"):
         has_samples = any(
             any(sample in (li.get("title") or "").lower() for sample in SAMPLE_PRODUCT_NAMES)
             for li in (order.get("line_items") or [])
