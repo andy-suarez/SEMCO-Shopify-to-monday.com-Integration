@@ -136,9 +136,9 @@ A single Shopify line item can contain multiple color selections via `properties
 
 If no color properties are found, the line item is created as-is with no color suffix.
 
-## SEMCO Pro LTL — SKU Summary Update
+## SEMCO Pro / Connect LTL — SKU Summary Update
 
-When a SEMCO Pro order ships via LTL, an update bubble (comment) is automatically added to the parent item on Monday.com. The update summarizes SKU counts in the format:
+When a SEMCO Pro or SEMCO Connect order ships via LTL, an update bubble (comment) is automatically added to the parent item on Monday.com. The update summarizes SKU counts in the format:
 
 ```
 {qty}: {sku}, {qty}: {sku}

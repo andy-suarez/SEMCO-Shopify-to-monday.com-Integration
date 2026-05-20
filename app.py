@@ -1219,8 +1219,8 @@ async def process_order(order: dict, store_key: str) -> None:
             context=f"Parent item '{item_name}' was created (ID: {parent_id}), but some subitems failed",
         )
 
-    # SEMCO Pro LTL orders: add SKU summary update bubble
-    if store_key == "semco_pro" and shipment_type == "LTL":
+    # SEMCO Pro / Connect LTL orders: add SKU summary update bubble
+    if store_key in ("semco_pro", "semco_connect") and shipment_type == "LTL":
         sku_counts: dict[str, int] = {}
         for li in line_items:
             sku = (li.get("sku") or "").strip()
@@ -1230,7 +1230,7 @@ async def process_order(order: dict, store_key: str) -> None:
         if sku_counts:
             sku_parts = [f"{qty}: {sku}" for sku, qty in sku_counts.items()]
             update_text = ", ".join(sku_parts) + "\nWater Based Building Products"
-            logger.info("Adding SKU summary update for Pro LTL order %s: %s", order_name, update_text)
+            logger.info("Adding SKU summary update for %s LTL order %s: %s", store_key, order_name, update_text)
             await create_update(parent_id, update_text)
 
 # ---------------------------------------------------------------------------
