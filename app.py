@@ -1015,9 +1015,10 @@ def _expand_line_item_colors(li: dict) -> list[dict]:
 
     Returns a list of dicts with keys: title, variant_title, color, quantity.
 
-    Two known property formats:
-      Spaces: [{'name': 'Color', 'value': 'Charcoal Grey'}]           → single color
-      Pro:    [{'name': 'Mojave', 'value': '3'}, {'name': 'Phantom', 'value': '4'}] → multi color
+    Three known property formats:
+      Spaces:  [{'name': 'Color', 'value': 'Charcoal Grey'}]                                → single color
+      Pro:     [{'name': 'Mojave', 'value': '3'}, {'name': 'Phantom', 'value': '4'}]        → multi color, value is qty
+      Connect: [{'name': 'Polar Bear', 'value': '1 Gallon'}, {'name': 'Blanco', 'value': '1 Gallon'}] → multi color, value is "<qty> <unit>"
     """
     product_title = li.get("title", "Unknown Product")
     variant_title = (li.get("variant_title") or "").strip()
@@ -1030,13 +1031,21 @@ def _expand_line_item_colors(li: dict) -> list[dict]:
             color = (prop.get("value") or "").strip()
             return [{"title": product_title, "variant_title": variant_title, "color": color, "quantity": total_quantity}]
 
-    # Check for Pro format: name is the color, value is the quantity (digit)
+    # Pro / Connect multi-color: name is the color, value carries the quantity.
+    # Pro values are pure digits ("3"); Connect values are "<qty> <unit>" ("1 Gallon").
     color_entries = []
     for prop in properties:
         prop_name = (prop.get("name") or "").strip()
         prop_value = (prop.get("value") or "").strip()
-        if prop_name and prop_value.isdigit():
-            color_entries.append({"title": product_title, "variant_title": variant_title, "color": prop_name, "quantity": int(prop_value)})
+        if not prop_name:
+            continue
+        if prop_value.isdigit():
+            qty = int(prop_value)
+        else:
+            head = prop_value.split(None, 1)[0] if prop_value else ""
+            qty = int(head) if head.isdigit() else None
+        if qty is not None:
+            color_entries.append({"title": product_title, "variant_title": variant_title, "color": prop_name, "quantity": qty})
 
     if color_entries:
         return color_entries

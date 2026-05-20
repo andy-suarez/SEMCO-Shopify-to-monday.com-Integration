@@ -134,6 +134,8 @@ A single Shopify line item can contain multiple color selections via `properties
 
 **Pro format:** `[{'name': 'Mojave', 'value': '3'}, {'name': 'Phantom', 'value': '4'}]` — multiple colors with individual quantities (property name = color, property value = quantity as digit).
 
+**Connect format:** `[{'name': 'Polar Bear', 'value': '1 Gallon'}, {'name': 'Blanco', 'value': '1 Gallon'}]` — multiple colors with quantity-plus-unit values (property name = color, property value = `"<qty> <unit>"`). Quantity is parsed from the leading integer; the unit string is discarded (the unit is already captured in `variant_title`, e.g. `Color Bond - 1 Gallon`).
+
 If no color properties are found, the line item is created as-is with no color suffix.
 
 ## SEMCO Pro / Connect LTL — SKU Summary Update
