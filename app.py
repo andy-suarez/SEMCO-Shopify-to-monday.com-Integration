@@ -886,7 +886,7 @@ async def log_sample_order(order: dict, store_key: str) -> None:
     for li in line_items:
         title = (li.get("title") or "").strip()
         # Only log sample items
-        if not any(sample in title.lower() for sample in SAMPLE_PRODUCT_NAMES):
+        if not _is_sample_title(title):
             continue
 
         variant_title = (li.get("variant_title") or "").strip()
@@ -1003,11 +1003,22 @@ def map_shipping_type(order: dict) -> str | None:
 # Order processing
 # ---------------------------------------------------------------------------
 
-# Sample product names to filter out (case-insensitive)
+# Sample product names to filter out (case- and whitespace-insensitive — see _is_sample_title)
 SAMPLE_PRODUCT_NAMES = [
-    "architectural sample kits",           # SEMCO Pro
-    "x-bond microcement physical color samples",  # SEMCO Spaces
+    "architectural sample kits",                    # SEMCO Pro / Connect
+    "x-bond microcement - individual color sample", # SEMCO Spaces
 ]
+
+
+def _is_sample_title(title: str) -> bool:
+    """True if a line item title matches a known sample product.
+
+    Normalizes case and collapses runs of whitespace before matching, so a
+    title like "X-Bond  Microcement -  Individual Color Sample" (stray double
+    spaces from the storefront) still matches the canonical single-spaced entry.
+    """
+    normalized = " ".join((title or "").lower().split())
+    return any(sample in normalized for sample in SAMPLE_PRODUCT_NAMES)
 
 
 def _expand_line_item_colors(li: dict) -> list[dict]:
@@ -1061,9 +1072,7 @@ def _is_sample_only_order(order: dict) -> bool:
         return False
 
     for li in line_items:
-        title = (li.get("title") or "").lower()
-        is_sample = any(sample in title for sample in SAMPLE_PRODUCT_NAMES)
-        if not is_sample:
+        if not _is_sample_title(li.get("title") or ""):
             return False  # Found a non-sample item — order should be posted
 
     return True  # All items are samples
@@ -1092,7 +1101,7 @@ async def process_order(order: dict, store_key: str) -> None:
     # log just the sample items to the sample inventory board
     if store_key in ("semco_pro", "semco_spaces", "semco_connect"):
         has_samples = any(
-            any(sample in (li.get("title") or "").lower() for sample in SAMPLE_PRODUCT_NAMES)
+            _is_sample_title(li.get("title") or "")
             for li in (order.get("line_items") or [])
         )
         if has_samples:

@@ -165,10 +165,9 @@ The Sample Inventory board has two groups:
 
 ### Sample Detection
 
-Products are identified as samples by matching titles against `SAMPLE_PRODUCT_NAMES`:
-- `"architectural sample kits"` (Pro)
-- `"x-bond microcement physical color samples"` (Spaces)
-- Connect: confirm and add the exact Connect sample product title (substring-matched, case-insensitive)
+Products are identified as samples by matching titles against `SAMPLE_PRODUCT_NAMES` via the `_is_sample_title()` helper, which lowercases and collapses runs of whitespace before substring-matching (so stray double-spaces in a storefront title still match):
+- `"architectural sample kits"` (Pro **and** Connect — same product title)
+- `"x-bond microcement - individual color sample"` (Spaces)
 
 ### Three Order Scenarios (Pro, Spaces, Connect)
 
