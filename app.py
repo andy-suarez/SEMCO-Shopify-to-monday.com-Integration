@@ -747,6 +747,49 @@ async def create_parent_item(item_name: str, column_values: dict) -> str | None:
         return None
 
 
+async def _order_already_on_board(order_name: str) -> bool:
+    """Durable duplicate guard for the orders board.
+
+    The in-memory `_processed_orders` set is wiped whenever the Render worker
+    restarts, so Shopify retries and re-sends that land on a fresh process slip
+    past it (Shopify guarantees at-least-once webhook delivery). Monday is the
+    only persistent store here, so we ask the board directly whether an item for
+    this order already exists. Parent item names always end with
+    `Order{order_name}` (e.g. ".../ Order#4255SS"), so we search for that token
+    and confirm the suffix to avoid substring collisions (#4255 vs #42551).
+
+    Fails open: on query error/timeout we return False so a real order is never
+    dropped — the in-memory guard remains as a backstop.
+    """
+    name_token = f"Order{order_name}"
+    query = """
+    query ($boardId: ID!, $qp: ItemsQuery!) {
+        boards(ids: [$boardId]) {
+            items_page(limit: 50, query_params: $qp) {
+                items { id name }
+            }
+        }
+    }
+    """
+    variables = {
+        "boardId": MONDAY_BOARD_ID,
+        "qp": {"rules": [{"column_id": "name", "compare_value": name_token, "operator": "contains_text"}]},
+    }
+    result = await monday_request(query, variables)
+    if not result or not result.get("data", {}).get("boards"):
+        logger.warning("DURABLE DEDUP: board lookup failed for order %s — proceeding (fail-open)", order_name)
+        return False
+    items = result["data"]["boards"][0]["items_page"]["items"]
+    for it in items:
+        if (it.get("name") or "").endswith(name_token):
+            logger.info(
+                "DURABLE DEDUP: Order %s already on board as '%s' (id=%s) — skipping duplicate",
+                order_name, it["name"], it["id"],
+            )
+            return True
+    return False
+
+
 async def create_subitem(parent_item_id: str, item_name: str, column_values: dict) -> str | None:
     query = """
     mutation ($parentItemId: ID!, $itemName: String!, $columnValues: JSON!) {
@@ -1088,6 +1131,15 @@ async def process_order(order: dict, store_key: str) -> None:
     logger.info("=" * 60)
     logger.info("PROCESSING ORDER: %s from store: %s", order_name, store_key)
     logger.info("=" * 60)
+
+    # Durable duplicate guard — survives worker restarts, unlike the in-memory
+    # set. Shopify delivers webhooks at-least-once, so retries/re-sends after a
+    # restart otherwise sneak past `_is_duplicate` and post the order again.
+    # Checked here (before sample logging) so a duplicate skips BOTH the order
+    # post and any sample-inventory decrement.
+    if await _order_already_on_board(order_name):
+        logger.info("SKIPPING ORDER %s: already present on orders board — duplicate delivery ignored (durable dedup)", order_name)
+        return
 
     # Filter out sample-only orders
     if _is_sample_only_order(order):
@@ -2109,15 +2161,25 @@ async def webhook(store_key: str, request: Request):
         logger.error("Webhook from %s: Failed to parse JSON body: %s", store_key, e)
         return Response(status_code=200, content="OK")
 
-    # Duplicate detection — check before processing
     order_id = order.get("id", "unknown")
     order_name = order.get("name", "unknown")
+
+    # Only process order creation. A store's webhook config (or Shopify Flow) can
+    # POST orders/updated, orders/paid, orders/fulfilled, etc. to this same URL —
+    # e.g. an order edit fires orders/updated with the same order_id — and those
+    # must NOT be re-posted as new orders. If the topic header is absent (a
+    # non-Shopify caller), fall through and process for backwards compatibility.
+    topic = request.headers.get("X-Shopify-Topic", "")
+    if topic and topic != "orders/create":
+        logger.info("IGNORING webhook: store=%s order=%s topic=%s (only orders/create is processed)", store_key, order_name, topic)
+        return Response(status_code=200, content="OK")
+
+    # Duplicate detection — check before processing
     if _is_duplicate(store_key, order_id):
         logger.info("DUPLICATE SKIPPED: Order %s (ID: %s) from %s already processed", order_name, order_id, store_key)
         return Response(status_code=200, content="OK")
 
-    topic = request.headers.get("X-Shopify-Topic", "unknown")
-    logger.info("Webhook received: store=%s order=%s topic=%s", store_key, order_name, topic)
+    logger.info("Webhook received: store=%s order=%s topic=%s", store_key, order_name, topic or "(none)")
 
     # Process in background so we respond to Shopify immediately
     asyncio.create_task(_safe_process_order(order, store_key, order_name))

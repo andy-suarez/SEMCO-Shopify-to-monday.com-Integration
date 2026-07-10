@@ -83,10 +83,17 @@ Column IDs are cached in memory and re-discovered whenever `MONDAY_BOARD_ID` cha
 - Compare against `X-Shopify-Hmac-Sha256` header using constant-time comparison
 - Return 401 on HMAC failure, 404 on unknown store_key
 
-### Duplicate Detection
-- In-memory tracking of processed Shopify order IDs (keyed by `store:order_id`)
-- 1-hour TTL — entries older than 3600 seconds are cleaned up automatically
-- Prevents double-processing when Shopify retries webhooks
+### Topic Filter
+- Only `X-Shopify-Topic: orders/create` is processed. Any other explicit topic (`orders/updated`, `orders/paid`, `orders/fulfilled`, etc.) is acked with 200 and ignored — an order edit fires `orders/updated` with the same order ID and must not be re-posted as a new order.
+- If the topic header is absent (non-Shopify caller), the webhook is processed anyway for backwards compatibility. The dev-only `/test` endpoint bypasses this handler entirely.
+
+### Duplicate Detection (two layers)
+Shopify guarantees **at-least-once** webhook delivery, so duplicate/redelivered `orders/create` events are expected and must be idempotent.
+
+1. **In-memory guard** (`_is_duplicate`): tracks processed order IDs keyed by `store:order_id` with a 1-hour TTL. Fast first-pass, but **wiped on every worker restart** and not shared across instances — so it misses retries that land on a fresh process.
+2. **Durable board guard** (`_order_already_on_board`): before posting, queries the orders board itself (the only persistent store) for an existing item whose name ends in `Order{order_name}`. Survives restarts. Runs early in `process_order` (before sample logging) so a duplicate skips **both** the order post and any sample-inventory decrement. Fails open on query error so real orders are never dropped.
+
+**Known gap:** sample-**only** orders never post to the orders board, so the durable guard can't catch a restart-surviving duplicate of one (would double-decrement inventory). Only the in-memory guard + topic filter protect that path today.
 
 ### Monday.com Item Structure (Orders Board)
 - **Parent item name:** `{Contact Name} / {Company Name} / Order{order_name}`
