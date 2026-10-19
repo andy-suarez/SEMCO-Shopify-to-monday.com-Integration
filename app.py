@@ -1077,7 +1077,14 @@ def _expand_line_item_colors(li: dict) -> list[dict]:
     product_title = li.get("title", "Unknown Product")
     variant_title = (li.get("variant_title") or "").strip()
     total_quantity = li.get("quantity", 1)
-    properties = li.get("properties") or []
+    # Ignore private properties (names starting with "_"). Shopify hides these
+    # from customers; apps such as the SEMCO Works coverage calculator use them
+    # for metadata (_area, _project, _prep, _source). Without this filter,
+    # "_area: 2500 sq ft" was parsed as a color named "_area" with qty 2500.
+    properties = [
+        p for p in (li.get("properties") or [])
+        if not (p.get("name") or "").strip().startswith("_")
+    ]
 
     # Check for Spaces format first (single property named "Color")
     for prop in properties:
