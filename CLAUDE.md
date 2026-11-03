@@ -84,7 +84,8 @@ Column IDs are cached in memory and re-discovered whenever `MONDAY_BOARD_ID` cha
 - Return 401 on HMAC failure, 404 on unknown store_key
 
 ### Topic Filter
-- Only `X-Shopify-Topic: orders/create` is processed. Any other explicit topic (`orders/updated`, `orders/paid`, `orders/fulfilled`, etc.) is acked with 200 and ignored — an order edit fires `orders/updated` with the same order ID and must not be re-posted as a new order.
+- `fulfillments/create` and `fulfillments/update` are routed to the tracking handler (Pro, Spaces, Connect only — see "Fulfillment Tracking" below).
+- Otherwise only `X-Shopify-Topic: orders/create` is processed. Any other explicit topic (`orders/updated`, `orders/paid`, `orders/fulfilled`, etc.) is acked with 200 and ignored — an order edit fires `orders/updated` with the same order ID and must not be re-posted as a new order.
 - If the topic header is absent (non-Shopify caller), the webhook is processed anyway for backwards compatibility. The dev-only `/test` endpoint bypasses this handler entirely.
 
 ### Duplicate Detection (two layers)
@@ -144,6 +145,23 @@ A single Shopify line item can contain multiple color selections via `properties
 **Connect format:** `[{'name': 'Polar Bear', 'value': '1 Gallon'}, {'name': 'Blanco', 'value': '1 Gallon'}]` — multiple colors with quantity-plus-unit values (property name = color, property value = `"<qty> <unit>"`). Quantity is parsed from the leading integer; the unit string is discarded (the unit is already captured in `variant_title`, e.g. `Color Bond - 1 Gallon`).
 
 If no color properties are found, the line item is created as-is with no color suffix.
+
+## Fulfillment Tracking → Monday.com (Pro, Spaces, Connect)
+
+When a fulfillment is created, or tracking is added to one later, Shopify sends `fulfillments/create` / `fulfillments/update` to the same `/webhook/{store_key}` URL (admin webhooks, signed with the same store secret). The body is a **fulfillment**, not an order. SEMCO Works is excluded (`TRACKING_STORES`).
+
+1. Order number comes from the fulfillment name: `#3991SS.1` → `#3991SS`.
+2. The parent item (name ending `Order#3991SS`) is looked up on `MONDAY_BOARD_ID` (Shopify Integration Board), then this month's and last month's boards (`SEMCO NOVEMBER 2026`, found by name, cached 1h), then any IDs in optional `MONDAY_TRACKING_EXTRA_BOARD_IDS` (comma-separated). Items keep their ID when the team moves them to the monthly board.
+3. Posts an **update** on the item listing every new tracking number as a link. (monday's API cannot attach a note to a specific status cell, so a regular update is used — it appears in the item's Updates feed like a status note does.)
+4. Fills the board's **`Tracking`** column (type **link**, matched by title) with the first number + `(+N more)`. If the board has no such column, only the update is posted.
+
+**Idempotency:** `fulfillments/update` fires on every shipment-status change. A tracking number that already appears in any update on the item is never posted again (Monday is the durable store); an in-memory guard and a per-order lock cover near-simultaneous create/update deliveries.
+
+**Tracking links:** Shopify's `tracking_urls` when present; otherwise built for UPS/FedEx/USPS/DHL; otherwise a Google search link (e.g. LTL PRO numbers).
+
+**Not found:** sample-only orders are skipped quietly (they never reach the orders board); anything else sends the failure email so tracking can be added by hand. Cancelled fulfillments and fulfillments without tracking are ignored.
+
+**Testing:** `POST /test` with `"_topic": "fulfillments/create"` and a fulfillment body (`name`, `tracking_company`, `tracking_numbers`, `tracking_urls`).
 
 ## SEMCO Pro / Connect LTL — SKU Summary Update
 
