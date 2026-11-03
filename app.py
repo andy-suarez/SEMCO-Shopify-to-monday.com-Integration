@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import zoneinfo
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from urllib.parse import quote_plus
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -2145,6 +2147,285 @@ async def dashboard_top_requested():
     return HTMLResponse(html)
 
 
+# ---------------------------------------------------------------------------
+# Fulfillment tracking → Monday.com (SEMCO Pro, Spaces, Connect only)
+# ---------------------------------------------------------------------------
+# When a fulfillment is created, or tracking is added to one later, Shopify
+# sends fulfillments/create or fulfillments/update. We find the order's item on
+# Monday and (1) post an update listing the tracking number(s) with links and
+# (2) fill the parent board's "Tracking" link column, if the board has one.
+#
+# Items start on MONDAY_BOARD_ID (the Shopify Integration Board) but the team
+# moves them to the monthly board ("SEMCO NOVEMBER 2026"), so the lookup also
+# checks this month's and last month's boards plus MONDAY_TRACKING_EXTRA_BOARD_IDS.
+#
+# Idempotency: fulfillments/update fires on every shipment-status change
+# (in transit, delivered, ...). A tracking number already mentioned in any
+# update on the item is never posted again — Monday is the durable store.
+
+TRACKING_STORES = {"semco_pro", "semco_spaces", "semco_connect"}
+TRACKING_TOPICS = {"fulfillments/create", "fulfillments/update"}
+TRACKING_COLUMN_TITLE = "Tracking"
+MONDAY_TRACKING_EXTRA_BOARD_IDS = [
+    b.strip() for b in os.environ.get("MONDAY_TRACKING_EXTRA_BOARD_IDS", "").split(",") if b.strip()
+]
+TRACKING_BOARD_CACHE_SECONDS = 3600
+TRACKING_COL_MISS_CACHE_SECONDS = 600  # re-check soon in case someone adds the column
+
+_MONTH_NAMES = [
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+    "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+]
+CARRIER_URL_TEMPLATES = {
+    "ups": "https://www.ups.com/track?tracknum={n}",
+    "fedex": "https://www.fedex.com/fedextrack/?trknbr={n}",
+    "usps": "https://tools.usps.com/go/TrackConfirmAction?tLabels={n}",
+    "dhl": "https://www.dhl.com/us-en/home/tracking/tracking-express.html?tracking-id={n}",
+}
+
+_tracking_board_cache: dict = {"fetched_at": 0.0, "monthly_ids": []}
+_tracking_col_cache: dict[str, tuple[str | None, float]] = {}  # board_id -> (col_id or None, cached_at)
+_processed_fulfillments: dict[str, float] = {}
+_tracking_locks: dict[str, asyncio.Lock] = {}
+
+
+def _is_duplicate_fulfillment(store_key: str, fulfillment: dict) -> bool:
+    """In-memory fast path: same fulfillment + same tracking numbers within the TTL."""
+    numbers = ",".join(sorted(e["number"] for e in _tracking_entries(fulfillment)))
+    key = f"{store_key}:{fulfillment.get('id')}:{numbers}"
+    now = time.time()
+    for k in [k for k, t in _processed_fulfillments.items() if now - t > DEDUP_TTL_SECONDS]:
+        del _processed_fulfillments[k]
+    if key in _processed_fulfillments:
+        return True
+    _processed_fulfillments[key] = now
+    return False
+
+
+def _order_name_from_fulfillment(fulfillment: dict) -> str | None:
+    """Fulfillment names are '<order name>.<n>', e.g. '#3991SS.1' → '#3991SS'."""
+    name = (fulfillment.get("name") or "").strip()
+    if "." not in name:
+        return None
+    return name.rsplit(".", 1)[0] or None
+
+
+def _tracking_url_fallback(company: str, number: str) -> str:
+    c = company.lower()
+    for key, template in CARRIER_URL_TEMPLATES.items():
+        if key in c:
+            return template.format(n=quote_plus(number))
+    # Unknown carrier (e.g. an LTL PRO number): a search still gets someone there in one click.
+    return "https://www.google.com/search?q=" + quote_plus(f"{company} tracking {number}".strip())
+
+
+def _tracking_entries(fulfillment: dict) -> list[dict]:
+    """Return [{'number', 'url'}] for every tracking number on the fulfillment."""
+    company = (fulfillment.get("tracking_company") or "").strip()
+    numbers = fulfillment.get("tracking_numbers") or (
+        [fulfillment["tracking_number"]] if fulfillment.get("tracking_number") else []
+    )
+    urls = fulfillment.get("tracking_urls") or (
+        [fulfillment["tracking_url"]] if fulfillment.get("tracking_url") else []
+    )
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(numbers):
+        number = str(raw or "").strip()
+        if not number or number in seen:
+            continue
+        seen.add(number)
+        url = urls[i] if i < len(urls) and urls[i] else _tracking_url_fallback(company, number)
+        entries.append({"number": number, "url": url})
+    return entries
+
+
+async def _monthly_board_ids() -> list[str]:
+    """IDs of this month's and last month's boards ('SEMCO NOVEMBER 2026'), cached."""
+    now = time.time()
+    if now - _tracking_board_cache["fetched_at"] < TRACKING_BOARD_CACHE_SECONDS:
+        return _tracking_board_cache["monthly_ids"]
+
+    today = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles"))
+    prev_month = 12 if today.month == 1 else today.month - 1
+    prev_year = today.year - 1 if today.month == 1 else today.year
+    wanted = [
+        f"SEMCO {_MONTH_NAMES[today.month - 1]} {today.year}",
+        f"SEMCO {_MONTH_NAMES[prev_month - 1]} {prev_year}",
+    ]
+
+    query = "query { boards(limit: 500, state: active, order_by: used_at) { id name } }"
+    result = await monday_request(query, {})
+    if not result or "data" not in result:
+        logger.warning("TRACKING: could not list boards to find the monthly boards — using cached list")
+        return _tracking_board_cache["monthly_ids"]
+
+    by_name: dict[str, str] = {}
+    for b in result["data"].get("boards") or []:
+        normalized = " ".join((b.get("name") or "").upper().split())
+        by_name.setdefault(normalized, str(b["id"]))
+    ids = [by_name[n] for n in wanted if n in by_name]
+    logger.info("TRACKING: monthly boards %s → %s", wanted, ids or "none found")
+
+    _tracking_board_cache["fetched_at"] = now
+    _tracking_board_cache["monthly_ids"] = ids
+    return ids
+
+
+async def _find_order_item(order_name: str) -> tuple[str, str, str] | None:
+    """Find the parent item for an order. Returns (item_id, board_id, item_name)."""
+    candidates: list[str] = []
+    for bid in [MONDAY_BOARD_ID, *(await _monthly_board_ids()), *MONDAY_TRACKING_EXTRA_BOARD_IDS]:
+        if bid and bid not in candidates:
+            candidates.append(bid)
+
+    name_token = f"Order{order_name}"
+    query = """
+    query ($boardId: ID!, $qp: ItemsQuery!) {
+        boards(ids: [$boardId]) {
+            items_page(limit: 50, query_params: $qp) {
+                items { id name }
+            }
+        }
+    }
+    """
+    for board_id in candidates:
+        variables = {
+            "boardId": board_id,
+            "qp": {"rules": [{"column_id": "name", "compare_value": name_token, "operator": "contains_text"}]},
+        }
+        result = await monday_request(query, variables)
+        if not result or not result.get("data", {}).get("boards"):
+            logger.warning("TRACKING: lookup failed on board %s for order %s", board_id, order_name)
+            continue
+        for it in result["data"]["boards"][0]["items_page"]["items"]:
+            # Confirm the suffix so #4255SS never matches #42551SS
+            if (it.get("name") or "").strip().endswith(name_token):
+                return str(it["id"]), board_id, it["name"]
+    logger.info("TRACKING: order %s not found on boards %s", order_name, candidates)
+    return None
+
+
+async def _board_tracking_col(board_id: str) -> str | None:
+    """Column ID of the board's 'Tracking' link column, or None if it has none."""
+    cached = _tracking_col_cache.get(board_id)
+    if cached and (cached[0] or time.time() - cached[1] < TRACKING_COL_MISS_CACHE_SECONDS):
+        return cached[0]
+
+    query = "query ($boardId: [ID!]) { boards(ids: $boardId) { columns { id title type } } }"
+    result = await monday_request(query, {"boardId": [board_id]})
+    col_id = None
+    if result and result.get("data", {}).get("boards"):
+        for col in result["data"]["boards"][0]["columns"]:
+            if (col.get("title") or "").strip().lower() == TRACKING_COLUMN_TITLE.lower() and col.get("type") == "link":
+                col_id = col["id"]
+                break
+    if not col_id:
+        logger.warning("TRACKING: board %s has no '%s' link column — posting the update only", board_id, TRACKING_COLUMN_TITLE)
+    _tracking_col_cache[board_id] = (col_id, time.time())
+    return col_id
+
+
+async def _item_update_text(item_id: str) -> str | None:
+    """All update text on an item (to avoid re-posting tracking). None if the query fails."""
+    query = "query ($ids: [ID!]) { items(ids: $ids) { updates(limit: 100) { text_body } } }"
+    result = await monday_request(query, {"ids": [item_id]})
+    if not result or not result.get("data", {}).get("items"):
+        return None
+    return "\n".join(u.get("text_body") or "" for u in result["data"]["items"][0].get("updates") or [])
+
+
+def _tracking_update_body(company: str, entries: list[dict], fulfillment_name: str) -> str:
+    carrier = html.escape(company) if company else "Carrier not specified"
+    lines = [f'<a href="{html.escape(e["url"], quote=True)}">{html.escape(e["number"])}</a>' for e in entries]
+    label = "Tracking number" if len(entries) == 1 else "Tracking numbers"
+    return (
+        f"📦 <b>{label} added</b> — {carrier}<br>"
+        + "<br>".join(lines)
+        + f"<br><i>From Shopify fulfillment {html.escape(fulfillment_name)}</i>"
+    )
+
+
+async def process_fulfillment(fulfillment: dict, store_key: str) -> None:
+    fulfillment_name = fulfillment.get("name") or str(fulfillment.get("id", "unknown"))
+    status = (fulfillment.get("status") or "").lower()
+    if status in ("cancelled", "error", "failure"):
+        logger.info("TRACKING: fulfillment %s has status '%s' — skipping", fulfillment_name, status)
+        return
+
+    entries = _tracking_entries(fulfillment)
+    if not entries:
+        logger.info("TRACKING: fulfillment %s has no tracking number yet — nothing to add", fulfillment_name)
+        return
+
+    order_name = _order_name_from_fulfillment(fulfillment)
+    if not order_name:
+        logger.error("TRACKING: could not read the order number from fulfillment name '%s'", fulfillment_name)
+        return
+
+    # Serialize per order: create + update webhooks for the same fulfillment can arrive together.
+    lock = _tracking_locks.setdefault(f"{store_key}:{order_name}", asyncio.Lock())
+    async with lock:
+        found = await _find_order_item(order_name)
+        if not found:
+            line_titles = [li.get("title") or "" for li in fulfillment.get("line_items") or []]
+            if line_titles and all(_is_sample_title(t) for t in line_titles):
+                logger.info("TRACKING: %s is a sample-only order (never on the orders board) — skipping", order_name)
+                return
+            logger.error("TRACKING: order %s not found on Monday — tracking not added", order_name)
+            numbers = ", ".join(e["number"] for e in entries)
+            send_failure_email(
+                store_key, order_name,
+                f"Order item not found on Monday.com. Tracking: {numbers}",
+                context="Tracking number could not be added — add it to the item by hand",
+            )
+            return
+        item_id, board_id, item_name = found
+
+        existing = await _item_update_text(item_id)
+        if existing is None:
+            logger.warning("TRACKING: could not read updates on item %s — posting anyway (fail-open)", item_id)
+            existing = ""
+        new_entries = [e for e in entries if e["number"] not in existing]
+        if not new_entries:
+            logger.info("TRACKING: %s already on item '%s' — nothing new", [e["number"] for e in entries], item_name)
+            return
+
+        company = (fulfillment.get("tracking_company") or "").strip()
+        await create_update(item_id, _tracking_update_body(company, new_entries, fulfillment_name))
+
+        col_id = await _board_tracking_col(board_id)
+        if col_id:
+            first = entries[0]
+            text = f"{company} {first['number']}".strip()
+            if len(entries) > 1:
+                text += f" (+{len(entries) - 1} more)"
+            mutation = """
+            mutation ($boardId: ID!, $itemId: ID!, $vals: JSON!) {
+                change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $vals) { id }
+            }
+            """
+            vals = json.dumps({col_id: {"url": first["url"], "text": text}})
+            if await monday_request(mutation, {"boardId": board_id, "itemId": item_id, "vals": vals}):
+                logger.info("TRACKING: set '%s' column on item %s → %s", TRACKING_COLUMN_TITLE, item_id, text)
+            else:
+                logger.error("TRACKING: failed to set '%s' column on item %s", TRACKING_COLUMN_TITLE, item_id)
+
+        logger.info(
+            "TRACKING: added %s to '%s' (item %s, board %s)",
+            [e["number"] for e in new_entries], item_name, item_id, board_id,
+        )
+
+
+async def _safe_process_fulfillment(fulfillment: dict, store_key: str) -> None:
+    try:
+        await process_fulfillment(fulfillment, store_key)
+    except Exception as e:
+        name = fulfillment.get("name") or "unknown"
+        logger.exception("UNHANDLED ERROR adding tracking for fulfillment %s from %s", name, store_key)
+        send_failure_email(store_key, name, f"Unhandled exception: {type(e).__name__}: {e}", context="Tracking update crashed unexpectedly")
+
+
 @app.post("/webhook/{store_key}")
 async def webhook(store_key: str, request: Request):
     if store_key not in STORES:
@@ -2177,6 +2458,20 @@ async def webhook(store_key: str, request: Request):
     # must NOT be re-posted as new orders. If the topic header is absent (a
     # non-Shopify caller), fall through and process for backwards compatibility.
     topic = request.headers.get("X-Shopify-Topic", "")
+
+    # Fulfillment tracking → Monday (Pro, Spaces, Connect). The body here is a
+    # fulfillment, not an order.
+    if topic in TRACKING_TOPICS:
+        if store_key not in TRACKING_STORES:
+            logger.info("IGNORING webhook: store=%s topic=%s (tracking sync is off for this store)", store_key, topic)
+            return Response(status_code=200, content="OK")
+        if _is_duplicate_fulfillment(store_key, order):
+            logger.info("DUPLICATE SKIPPED: fulfillment %s from %s already processed", order_name, store_key)
+            return Response(status_code=200, content="OK")
+        logger.info("Webhook received: store=%s fulfillment=%s topic=%s", store_key, order_name, topic)
+        asyncio.create_task(_safe_process_fulfillment(order, store_key))
+        return Response(status_code=200, content="OK")
+
     if topic and topic != "orders/create":
         logger.info("IGNORING webhook: store=%s order=%s topic=%s (only orders/create is processed)", store_key, order_name, topic)
         return Response(status_code=200, content="OK")
@@ -2317,6 +2612,17 @@ async def test_endpoint(request: Request):
     if store_key not in STORES:
         logger.warning("Test endpoint: Unknown store_key '%s' — defaulting to semco_pro", store_key)
         store_key = "semco_pro"
+
+    # "_topic": "fulfillments/create" posts the body as a fulfillment (tracking test)
+    test_topic = order.pop("_topic", "")
+    if test_topic in TRACKING_TOPICS:
+        logger.info("Test endpoint: processing fulfillment %s as %s", order.get("name"), store_key)
+        try:
+            await process_fulfillment(order, store_key)
+        except Exception:
+            logger.exception("UNHANDLED ERROR processing test fulfillment %s", order.get("name"))
+            return {"status": "error", "fulfillment": order.get("name"), "store": store_key, "message": "See server logs"}
+        return {"status": "processed", "fulfillment": order.get("name"), "store": store_key}
 
     logger.info("Test endpoint: processing order %s as %s", order.get("name"), store_key)
 
