@@ -681,6 +681,43 @@ def send_failure_email(store_key: str, order_name: str, error_details: str, cont
 # Monday.com helpers
 # ---------------------------------------------------------------------------
 
+# One shared HTTP client for the whole process. Creating a new AsyncClient per
+# call meant a new TLS context + connection for every Monday/Shopify request;
+# on this image that left memory behind each time and the instance climbed
+# ~15-20 MB/hour until Render OOM-killed it at 512 MB. A shared client reuses
+# connections and stays flat.
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=30,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=60),
+        )
+    return _http_client
+
+
+def _rss_mb() -> float:
+    """Resident memory of this process in MB (Linux)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1_000_000
+    except Exception:
+        return -1.0
+
+
+def _release_memory(context: str) -> None:
+    """Return freed heap to the OS (glibc) and log RSS so leaks show up in the logs."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    logger.info("MEMORY after %s: rss=%.1f MB", context, _rss_mb())
+
+
 async def monday_request(query: str, variables: dict) -> dict | None:
     headers = {
         "Authorization": MONDAY_API_KEY,
@@ -689,9 +726,8 @@ async def monday_request(query: str, variables: dict) -> dict | None:
     payload = {"query": query, "variables": variables}
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(MONDAY_API_URL, headers=headers, json=payload)
-            data = resp.json()
+        resp = await _get_http_client().post(MONDAY_API_URL, headers=headers, json=payload)
+        data = resp.json()
     except httpx.TimeoutException:
         logger.error("Monday.com API request TIMED OUT after 30s. Query: %s", query[:100])
         return None
@@ -1366,8 +1402,7 @@ async def _shopify_mint_token(store_key: str) -> str | None:
         "grant_type": "client_credentials",
     }
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(url, json=payload)
+        resp = await _get_http_client().post(url, json=payload)
     except httpx.TimeoutException:
         logger.error("Shopify token mint TIMED OUT for store '%s'", store_key)
         return None
@@ -1432,8 +1467,7 @@ async def shopify_request(
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.request(method, url, headers=headers, json=json_body)
+            resp = await _get_http_client().request(method, url, headers=headers, json=json_body)
         except httpx.TimeoutException:
             logger.error("Shopify %s %s TIMED OUT (store=%s)", method, path, store_key)
             return None
@@ -1816,6 +1850,12 @@ async def _on_startup() -> None:
     asyncio.create_task(_warmup_caches())
 
 
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+
+
 async def _warmup_caches() -> None:
     """Discover column IDs for the orders board and the sample board on startup.
 
@@ -1855,6 +1895,7 @@ async def health():
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "rss_mb": round(_rss_mb(), 1),
     }
 
 
@@ -2424,6 +2465,8 @@ async def _safe_process_fulfillment(fulfillment: dict, store_key: str) -> None:
         name = fulfillment.get("name") or "unknown"
         logger.exception("UNHANDLED ERROR adding tracking for fulfillment %s from %s", name, store_key)
         send_failure_email(store_key, name, f"Unhandled exception: {type(e).__name__}: {e}", context="Tracking update crashed unexpectedly")
+    finally:
+        _release_memory(f"fulfillment {fulfillment.get('name') or 'unknown'}")
 
 
 @app.post("/webhook/{store_key}")
@@ -2497,6 +2540,8 @@ async def _safe_process_order(order: dict, store_key: str, order_name: str) -> N
     except Exception as e:
         logger.exception("UNHANDLED ERROR processing order %s from %s", order_name, store_key)
         send_failure_email(store_key, order_name, f"Unhandled exception: {type(e).__name__}: {e}", context="Order processing crashed unexpectedly")
+    finally:
+        _release_memory(f"order {order_name}")
 
 
 @app.api_route("/sync-inventory", methods=["GET", "POST"])
@@ -2585,6 +2630,7 @@ async def sync_inventory(request: Request):
 
     _sync_run_state["last_run_finished_at"] = time.time()
     _sync_run_state["in_progress"] = False
+    _release_memory("inventory sync")
 
     duration = _sync_run_state["last_run_finished_at"] - _sync_run_state["last_run_started_at"]
     logger.info(
