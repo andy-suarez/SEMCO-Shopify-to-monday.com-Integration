@@ -106,6 +106,10 @@ Shopify guarantees **at-least-once** webhook delivery, so duplicate/redelivered 
 ### Monday.com API Auth
 - Pass API key in `Authorization` header as raw key (NOT Bearer token)
 
+### HTTP Client & Memory
+- All Monday.com and Shopify calls share ONE `httpx.AsyncClient` (`_get_http_client()`), closed on shutdown. Never create a client per request: that opened a new TLS connection every call and the 512 MB instance was OOM-killed roughly daily (Nov 2026).
+- After each order, fulfillment and inventory sync, `_release_memory()` runs `malloc_trim` and logs `MEMORY after ...: rss=X MB` — search the Render logs for `MEMORY` to see the trend. `/health` also returns `rss_mb`.
+
 ### Error Handling
 - Always return 200 to Shopify immediately, even if Monday.com calls fail
 - Orders process in the background via `asyncio.create_task`
